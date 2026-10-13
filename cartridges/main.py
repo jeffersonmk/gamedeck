@@ -17,7 +17,7 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import json
+import logging
 import lzma
 import shlex
 import sys
@@ -54,6 +54,12 @@ from cartridges.store.managers.file_manager import FileManager
 from cartridges.store.managers.sgdb_manager import SgdbManager
 from cartridges.store.managers.steam_api_manager import SteamAPIManager
 from cartridges.store.store import Store
+from cartridges.utils.json_file import (
+    is_game_file,
+    is_valid_game_data,
+    read_json,
+    write_json_atomic,
+)
 from cartridges.utils.run_executable import run_executable
 from cartridges.window import CartridgesWindow
 
@@ -122,6 +128,7 @@ class CartridgesApplication(Adw.Application):
         self.state = shared.AppState.LOAD_FROM_DISK
         self.load_games_from_disk()
         self.state = shared.AppState.DEFAULT
+        shared.win.set_library_child()
         shared.win.create_source_rows()
 
         # Add rest of the managers for game imports
@@ -184,10 +191,8 @@ class CartridgesApplication(Adw.Application):
             self.init_search_term = search.get_string()
         elif game_id := options.lookup_value("launch"):
             try:
-                data = json.load(
-                    (path := shared.games_dir / (game_id.get_string() + ".json")).open(
-                        "r", encoding="utf-8"
-                    )
+                data = read_json(
+                    path := shared.games_dir / (game_id.get_string() + ".json")
                 )
                 executable = (
                     shlex.join(data["executable"])
@@ -199,9 +204,9 @@ class CartridgesApplication(Adw.Application):
                 run_executable(executable)
 
                 data["last_played"] = int(time())
-                json.dump(data, path.open("w", encoding="utf-8"))
+                write_json_atomic(path, data)
 
-            except (IndexError, KeyError, OSError, json.decoder.JSONDecodeError):
+            except (IndexError, KeyError, TypeError, OSError, ValueError):
                 return 1
 
             self.register()
@@ -218,14 +223,28 @@ class CartridgesApplication(Adw.Application):
         return -1
 
     def load_games_from_disk(self) -> None:
-        if shared.games_dir.is_dir():
-            for game_file in shared.games_dir.iterdir():
-                try:
-                    data = json.load(game_file.open())
-                except (OSError, json.decoder.JSONDecodeError):
-                    continue
-                game = Game(data)
-                shared.store.add_game(game, {"skip_save": True})
+        if not shared.games_dir.is_dir():
+            return
+
+        loaded = 0
+        for game_file in shared.games_dir.iterdir():
+            if not is_game_file(game_file):
+                continue
+            try:
+                data = read_json(game_file)
+            except (OSError, ValueError):  # ValueError covers bad JSON/UTF-8
+                logging.warning("Skipping unreadable game file %s", game_file)
+                continue
+            if not is_valid_game_data(data):
+                logging.warning("Skipping invalid game file %s", game_file)
+                continue
+            # Sorting by date needs it; very old/hand-edited files may lack it
+            data.setdefault("added", 0)
+            game = Game(data)
+            shared.store.add_game(game, {"skip_save": True})
+            loaded += 1
+
+        logging.debug("Loaded %d game files from disk", loaded)
 
     def get_source_name(self, source_id: str) -> Any:
         if source_id == "all":

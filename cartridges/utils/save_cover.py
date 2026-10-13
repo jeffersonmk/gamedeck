@@ -18,6 +18,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 
+import threading
 from pathlib import Path
 from shutil import copyfile
 from typing import Optional
@@ -28,11 +29,24 @@ from PIL import Image, ImageSequence, UnidentifiedImageError
 from cartridges import shared
 
 
+def _new_tmp_path(template: str) -> Path:
+    file, stream = Gio.File.new_tmp(template)
+    stream.close()
+    return Path(file.get_path())
+
+
 def convert_cover(
     cover_path: Optional[Path] = None,
     pixbuf: Optional[GdkPixbuf.Pixbuf] = None,
     resize: bool = True,
 ) -> Optional[Path]:
+    """Convert an image to the cover format.
+
+    Returns either `cover_path` itself (only when `resize` is False and the
+    format is already supported) or a new temporary file owned by the caller,
+    who should remove it with `remove_tmp_cover` once done.
+    Intermediate temporary files are always removed.
+    """
     if not cover_path and not pixbuf:
         return None
 
@@ -44,8 +58,9 @@ def convert_cover(
     if not resize and cover_path and cover_path.suffix.lower()[1:] in pixbuf_extensions:
         return cover_path
 
+    intermediate: Optional[Path] = None
     if pixbuf:
-        cover_path = Path(Gio.File.new_tmp("XXXXXX.tiff")[0].get_path())
+        cover_path = intermediate = _new_tmp_path("XXXXXX.tiff")
         pixbuf.savev(str(cover_path), "tiff")
 
     try:
@@ -56,7 +71,7 @@ def convert_cover(
                     for frame in ImageSequence.Iterator(image)
                 )
 
-                tmp_path = Path(Gio.File.new_tmp("XXXXXX.gif")[0].get_path())
+                tmp_path = _new_tmp_path("XXXXXX.gif")
                 frames[0].save(
                     tmp_path,
                     save_all=True,
@@ -69,7 +84,7 @@ def convert_cover(
                 if image.mode not in ("RGB", "RGBA"):
                     image = image.convert("RGBA")
 
-                tmp_path = Path(Gio.File.new_tmp("XXXXXX.tiff")[0].get_path())
+                tmp_path = _new_tmp_path("XXXXXX.tiff")
                 (image.resize(shared.image_size) if resize else image).save(
                     tmp_path,
                     compression="tiff_adobe_deflate"
@@ -78,17 +93,34 @@ def convert_cover(
                 )
     except UnidentifiedImageError:
         try:
-            Gdk.Texture.new_from_filename(str(cover_path)).save_to_tiff(
-                tmp_path := Gio.File.new_tmp("XXXXXX.tiff")[0].get_path()
-            )
-            return convert_cover(tmp_path)
+            fallback = _new_tmp_path("XXXXXX.tiff")
+            Gdk.Texture.new_from_filename(str(cover_path)).save_to_tiff(str(fallback))
+            try:
+                return convert_cover(fallback)
+            finally:
+                fallback.unlink(missing_ok=True)
         except GLib.Error:
             return None
+    finally:
+        if intermediate:
+            intermediate.unlink(missing_ok=True)
 
     return tmp_path
 
 
+def remove_tmp_cover(path: Optional[Path], *originals: Optional[Path]) -> None:
+    """Remove a temporary file returned by `convert_cover`/a download,
+    unless it is one of the caller's original (non-temporary) files."""
+    if path and path not in originals:
+        Path(path).unlink(missing_ok=True)
+
+
 def save_cover(game_id: str, cover_path: Path) -> None:
+    """Store `cover_path` as the cover of `game_id`.
+
+    Safe to call from worker threads: the file operations happen in the
+    calling thread, the widget update is always done on the main thread.
+    """
     shared.covers_dir.mkdir(parents=True, exist_ok=True)
 
     animated_path = shared.covers_dir / f"{game_id}.gif"
@@ -101,12 +133,15 @@ def save_cover(game_id: str, cover_path: Path) -> None:
     if not cover_path:
         return
 
-    copyfile(
-        cover_path,
-        animated_path if cover_path.suffix == ".gif" else static_path,
-    )
+    new_path = animated_path if cover_path.suffix == ".gif" else static_path
+    copyfile(cover_path, new_path)
 
-    if game_id in shared.win.game_covers:
-        shared.win.game_covers[game_id].new_cover(
-            animated_path if cover_path.suffix == ".gif" else static_path
-        )
+    def update_displayed_cover() -> bool:
+        if shared.win and game_id in shared.win.game_covers:
+            shared.win.game_covers[game_id].new_cover(new_path)
+        return False
+
+    if threading.current_thread() is threading.main_thread():
+        update_displayed_cover()
+    else:
+        GLib.idle_add(update_displayed_cover)

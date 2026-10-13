@@ -70,7 +70,11 @@ class DisplayManager(Manager):
                 shared.win.library.append(game)
             game.get_parent().set_focusable(False)
 
-        shared.win.set_library_child()
+        # Recomputing the empty/no-results overlay walks the whole library:
+        # skip it while loading from disk (done once afterwards) and
+        # coalesce it otherwise (e.g. hundreds of games added by an import)
+        if shared.win.get_application().state != shared.AppState.LOAD_FROM_DISK:
+            shared.win.queue_set_library_child()
 
         if shared.win.get_application().state == shared.AppState.DEFAULT:
-            shared.win.create_source_rows()
+            shared.win.queue_create_source_rows()

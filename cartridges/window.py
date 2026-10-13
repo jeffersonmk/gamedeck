@@ -211,12 +211,22 @@ class CartridgesWindow(Adw.ApplicationWindow):
 
         self.filter_state = value
         self.library.invalidate_filter()
+        self.set_library_child()
 
         if self.overlay_split_view.get_collapsed():
             self.overlay_split_view.set_show_sidebar(False)
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+
+        self._library_child_queued = False
+        self._source_rows_queued = False
+
+        # One handler for every game instead of one connection per game,
+        # which kept removed games alive and scaled with the library size
+        shared.schema.connect(
+            "changed::cover-launches-game", self.on_cover_launches_game_changed
+        )
 
         if platform == "darwin":
             self.sidebar_navigation_page.set_title("")
@@ -284,6 +294,37 @@ class CartridgesWindow(Adw.ApplicationWindow):
     def search_changed(self, _widget: Any, hidden: bool) -> None:
         # Refresh search filter on keystroke in search box
         (self.hidden_library if hidden else self.library).invalidate_filter()
+        self.set_library_child()
+
+    def queue_set_library_child(self) -> None:
+        """Coalesce several set_library_child() requests into one idle call"""
+        if self._library_child_queued:
+            return
+        self._library_child_queued = True
+
+        def run() -> bool:
+            self._library_child_queued = False
+            self.set_library_child()
+            return False
+
+        GLib.idle_add(run)
+
+    def queue_create_source_rows(self) -> None:
+        """Coalesce several create_source_rows() requests into one idle call"""
+        if self._source_rows_queued:
+            return
+        self._source_rows_queued = True
+
+        def run() -> bool:
+            self._source_rows_queued = False
+            self.create_source_rows()
+            return False
+
+        GLib.idle_add(run)
+
+    def on_cover_launches_game_changed(self, *_args: Any) -> None:
+        for game in shared.store:
+            game.set_play_icon()
 
     def set_library_child(self) -> None:
         child, hidden_child = self.notice_empty, self.hidden_notice_empty
@@ -342,7 +383,6 @@ class CartridgesWindow(Adw.ApplicationWindow):
                 filtered = True
 
         game.filtered = filtered
-        self.set_library_child()
 
         return not filtered
 
@@ -423,17 +463,18 @@ class CartridgesWindow(Adw.ApplicationWindow):
         elif self.sort_state == "a-z":
             order = False
 
-        def get_value(index: int) -> str:
-            return (
-                str(getattr((child1.get_child(), child2.get_child())[index], var))
-                .lower()
-                .removeprefix("the ")
-            )
+        game1, game2 = child1.get_child(), child2.get_child()
 
-        if var != "name" and get_value(0) == get_value(1):
+        def get_value(game: Game, attr: str) -> str:
+            return str(getattr(game, attr)).lower().removeprefix("the ")
+
+        value1, value2 = get_value(game1, var), get_value(game2, var)
+
+        if var != "name" and value1 == value2:
             var, order = "name", False
+            value1, value2 = get_value(game1, var), get_value(game2, var)
 
-        return ((get_value(0) > get_value(1)) ^ order) * 2 - 1
+        return ((value1 > value2) ^ order) * 2 - 1
 
     def set_show_hidden(self, navigation_view: Adw.NavigationView, *_args: Any) -> None:
         self.lookup_action("show_hidden").set_enabled(

@@ -17,12 +17,11 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-import json
-
 from cartridges import shared
 from cartridges.game import Game
 from cartridges.store.managers.async_manager import AsyncManager
 from cartridges.store.managers.steam_api_manager import SteamAPIManager
+from cartridges.utils.json_file import write_json_atomic
 
 
 class FileManager(AsyncManager):
@@ -34,8 +33,6 @@ class FileManager(AsyncManager):
     def main(self, game: Game, additional_data: dict) -> None:
         if additional_data.get("skip_save"):  # Skip saving when loading games from disk
             return
-
-        shared.games_dir.mkdir(parents=True, exist_ok=True)
 
         attrs = (
             "added",
@@ -51,9 +48,11 @@ class FileManager(AsyncManager):
             "version",
         )
 
-        json.dump(
-            {attr: getattr(game, attr) for attr in attrs if attr},
-            (shared.games_dir / f"{game.game_id}.json").open("w", encoding="utf-8"),
+        # Atomic write: the previous file survives a crash or a full disk,
+        # and the handle is always closed (it used to be left to the GC)
+        write_json_atomic(
+            shared.games_dir / f"{game.game_id}.json",
+            {attr: getattr(game, attr) for attr in attrs},
             indent=4,
             sort_keys=True,
         )

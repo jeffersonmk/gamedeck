@@ -28,7 +28,7 @@ from requests.exceptions import HTTPError
 
 from cartridges import shared
 from cartridges.game import Game
-from cartridges.utils.save_cover import convert_cover, save_cover
+from cartridges.utils.save_cover import convert_cover, remove_tmp_cover, save_cover
 
 
 class SgdbError(Exception):
@@ -128,13 +128,16 @@ class SgdbHelper:
 
         # Download covers
         for uri_kwargs in image_uri_kwargs_sets:
+            tmp_path = converted = None
             try:
                 uri = self.get_image_uri(sgdb_id, **uri_kwargs)
                 response = requests.get(uri, timeout=5)
-                tmp_file = Gio.File.new_tmp()[0]
-                tmp_file_path = tmp_file.get_path()
-                Path(tmp_file_path).write_bytes(response.content)
-                save_cover(game.game_id, convert_cover(tmp_file_path))
+                tmp_file, stream = Gio.File.new_tmp()
+                stream.close()
+                tmp_path = Path(tmp_file.get_path())
+                tmp_path.write_bytes(response.content)
+                converted = convert_cover(tmp_path)
+                save_cover(game.game_id, converted)
             except SgdbAuthError as error:
                 # Let caller handle auth errors
                 raise error
@@ -149,6 +152,9 @@ class SgdbHelper:
             else:
                 # Stop as soon as one is finished
                 return
+            finally:
+                remove_tmp_cover(converted, tmp_path)
+                remove_tmp_cover(tmp_path)
 
         # No image was added
         logging.warning(

@@ -27,9 +27,9 @@ from requests.exceptions import HTTPError, SSLError
 
 from cartridges import shared
 from cartridges.game import Game
-from cartridges.store.managers.manager import Manager
+from cartridges.store.managers.async_manager import AsyncManager
 from cartridges.store.managers.steam_api_manager import SteamAPIManager
-from cartridges.utils.save_cover import convert_cover, save_cover
+from cartridges.utils.save_cover import convert_cover, remove_tmp_cover, save_cover
 
 
 class ImageSize(NamedTuple):
@@ -80,7 +80,7 @@ class ImageSize(NamedTuple):
         return ImageSize(1, 1).element_wise_div(self)
 
 
-class CoverManager(Manager):
+class CoverManager(AsyncManager):
     """
     Manager in charge of adding the cover image of the game
 
@@ -88,17 +88,27 @@ class CoverManager(Manager):
     1. local cover
     2. icon cover
     3. online cover
+
+    Runs in a worker thread: it downloads and re-encodes images, which used to
+    freeze the UI during imports (save_cover hands the widget update back to
+    the main thread).
     """
 
     run_after = (SteamAPIManager,)
     retryable_on = (HTTPError, SSLError, ConnectionError)
 
+
     def download_image(self, url: str) -> Path:
-        image_file = Gio.File.new_tmp()[0]
+        image_file, stream = Gio.File.new_tmp()
+        stream.close()
         path = Path(image_file.get_path())
-        with requests.get(url, timeout=5) as cover:
-            cover.raise_for_status()
-            path.write_bytes(cover.content)
+        try:
+            with requests.get(url, timeout=5) as cover:
+                cover.raise_for_status()
+                path.write_bytes(cover.content)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
         return path
 
     def is_stretchable(self, source_size: ImageSize, cover_size: ImageSize) -> bool:
@@ -128,9 +138,11 @@ class CoverManager(Manager):
         """
 
         # Load source image
-        source = GdkPixbuf.Pixbuf.new_from_file(
-            str(convert_cover(image_path, resize=False))
-        )
+        converted = convert_cover(image_path, resize=False)
+        try:
+            source = GdkPixbuf.Pixbuf.new_from_file(str(converted))
+        finally:
+            remove_tmp_cover(converted, image_path)
         source_size = ImageSize(source.get_width(), source.get_height())
         cover_size = ImageSize._make(shared.image_size)
 
@@ -176,8 +188,9 @@ class CoverManager(Manager):
             # Get an image path
             if not (value := additional_data.get(key)):
                 continue
+            downloaded = None
             if key == "online_cover_url":
-                image_path = self.download_image(value)
+                image_path = downloaded = self.download_image(value)
             else:
                 image_path = Path(value)
             if not image_path.is_file():
@@ -190,9 +203,12 @@ class CoverManager(Manager):
                 composite_kwargs["scale"] = 0.7
                 composite_kwargs["blur_size"] = ImageSize(1, 2)
 
-            save_cover(
-                game.game_id,
-                convert_cover(
+            cover_path = None
+            try:
+                cover_path = convert_cover(
                     pixbuf=self.composite_cover(image_path, **composite_kwargs)
-                ),
-            )
+                )
+                save_cover(game.game_id, cover_path)
+            finally:
+                remove_tmp_cover(cover_path)
+                remove_tmp_cover(downloaded)

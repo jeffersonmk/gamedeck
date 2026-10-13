@@ -79,8 +79,6 @@ class Game(Gtk.Box):
         self.cover_button.connect("clicked", self.main_button_clicked, False)
         self.play_button.connect("clicked", self.main_button_clicked, True)
 
-        shared.schema.connect("changed", self.schema_changed)
-
     def update_values(self, data: dict[str, Any]) -> None:
         for key, value in data.items():
             # Convert executables to strings
@@ -189,10 +187,6 @@ class Game(Gtk.Box):
             if shared.schema.get_boolean("cover-launches-game")
             else "media-playback-start-symbolic"
         )
-
-    def schema_changed(self, _settings: Any, key: str) -> None:
-        if key == "cover-launches-game":
-            self.set_play_icon()
 
     @GObject.Signal(name="update-ready", arg_types=[object])
     def update_ready(self, _additional_data):  # type: ignore

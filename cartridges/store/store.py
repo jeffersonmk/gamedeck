@@ -41,6 +41,9 @@ class Store:
         self.pipeline_managers = set()
         self.pipelines = {}
         self.source_games = {}
+        # game_id -> Game index, kept in sync with source_games by add_game.
+        # Avoids a linear scan per lookup (quadratic when loading the library).
+        self._games_by_id: dict[str, Game] = {}
         self.new_game_ids = set()
         self.duplicate_game_ids = set()
 
@@ -64,10 +67,10 @@ class Store:
 
     def __getitem__(self, game_id: str) -> Game:
         """Get a game by its id with `store["game_id_goes_here"]`"""
-        for game in iter(self):
-            if game.game_id == game_id:
-                return game
-        raise KeyError("Game not found in store")
+        try:
+            return self._games_by_id[game_id]
+        except KeyError:
+            raise KeyError("Game not found in store") from None
 
     def get(self, game_id: str, default: Any = None) -> Game | Any:
         """Get a game by its ID, with a fallback if not found"""
@@ -127,7 +130,9 @@ class Store:
         stored_game = self.get(game.game_id)
         if not stored_game:
             # New game, do as normal
-            logging.debug("New store game %s (%s)", game.name, game.game_id)
+            # Not logged for every game loaded from disk at startup (slow)
+            if not additional_data.get("skip_save"):
+                logging.debug("New store game %s (%s)", game.name, game.game_id)
             self.new_game_ids.add(game.game_id)
         elif stored_game.removed:
             # Will replace a removed game, cleanup its remains
@@ -137,6 +142,10 @@ class Store:
                 game.game_id,
             )
             self.cleanup_game(stored_game)
+            # Drop the removed entry so a game_id is only ever stored once
+            if (mapping := self.source_games.get(stored_game.base_source)) is not None:
+                if mapping.get(stored_game.game_id) is stored_game:
+                    del mapping[stored_game.game_id]
             self.new_game_ids.add(game.game_id)
         else:
             # Duplicate game, ignore it
@@ -153,6 +162,7 @@ class Store:
         if not game.base_source in self.source_games:
             self.source_games[game.base_source] = {}
         self.source_games[game.base_source][game.game_id] = game
+        self._games_by_id[game.game_id] = game
 
         # Run the pipeline for the game
         if not run_pipeline:

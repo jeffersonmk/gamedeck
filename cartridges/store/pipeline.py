@@ -99,7 +99,8 @@ class Pipeline(GObject.Object):
 
     def manager_callback(self, manager: Manager) -> None:
         """Method called by a manager when it's done"""
-        logging.debug("%s done for %s", manager.name, self.game.game_id)
+        if not self.additional_data.get("skip_save"):  # not at startup (slow)
+            logging.debug("%s done for %s", manager.name, self.game.game_id)
         self.running.remove(manager)
         self.done.add(manager)
         self.emit("advanced")
