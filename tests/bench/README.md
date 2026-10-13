@@ -1,56 +1,56 @@
-# Benchmark do GameDeck
+# GameDeck benchmark
 
-`bench.py` mede o build **instalado** (via `meson install`) usando uma
-biblioteca sintética e um ambiente isolado: HOME/XDG/TMPDIR falsos,
-GSettings em memória e o backend Broadway do GTK (headless). Seus jogos,
-configurações e a sua tela não são tocados. A rede é desativada (a chamada à
-API da Steam é substituída por um stub).
+`bench.py` measures an **installed** build (via `meson install`) against a
+synthetic library in an isolated environment: fake HOME/XDG/TMPDIR, in-memory
+GSettings and GTK's headless Broadway backend. Your games, settings and
+display are never touched. Network access is disabled (the Steam API call is
+replaced with a stub).
 
-## Como rodar
+## Running
 
 ```sh
-# 1. Instalar o build num prefixo local (perfil release)
+# 1. Install the build into a local prefix (release profile)
 meson setup _build --prefix="$PWD/_install" -Dprofile=release
 meson install -C _build
 
-# 2. Biblioteca pequena e grande (mediana de N execuções)
+# 2. Small and large library (median of N runs)
 python3 tests/bench/bench.py --prefix _install --games 100  --import-games 50  --runs 5 --out small.json
 python3 tests/bench/bench.py --prefix _install --games 2000 --import-games 300 --runs 5 --out large.json
 ```
 
-Para comparar com outra versão, instale-a em outro prefixo (ex.: um
-`git worktree` da versão anterior) e rode o mesmo comando com `--prefix`
-apontando para ele. Use sempre o mesmo `--workdir` para reaproveitar a mesma
-biblioteca sintética.
+To compare with another version, install it into a different prefix (e.g. a
+`git worktree` of the previous version) and run the same command with
+`--prefix` pointing at it. Keep the same `--workdir` so both runs use the same
+synthetic library.
 
-## Métricas
+## Metrics
 
-| Métrica | Significado |
+| Metric | Meaning |
 |---|---|
-| `activate_s` | Duração de `do_activate` (thread principal bloqueada carregando a biblioteca) |
-| `ready_s` | Do início do processo até o loop principal ficar livre após apresentar a janela |
-| `covers_ready_s` | Até todas as capas estarem decodificadas e aplicadas (inclui o primeiro layout) |
-| `search_ms` / `sort_ms` | Tempo síncrono de refiltrar/reordenar a biblioteca (uma tecla na busca) |
-| `rss_mb_*` | Memória residente após abrir / após importar |
-| `import_total_s` | Importação Steam de N jogos com capas locais 600×900 |
-| `import_max_gap_ms` | Maior travamento do loop principal durante a importação (UI congelada) |
-| `import_gaps_50ms` | Quantos travamentos > 50 ms houve durante a importação |
-| `tmp_files_left` | Arquivos temporários deixados para trás (vazamento) |
+| `activate_s` | Duration of `do_activate` (main thread blocked loading the library) |
+| `ready_s` | From process start until the main loop is free after presenting the window |
+| `covers_ready_s` | Until every cover is decoded and applied (includes the first layout) |
+| `search_ms` / `sort_ms` | Synchronous re-filter/re-sort of the library (one keystroke in search) |
+| `rss_mb_*` | Resident memory after startup / after the import |
+| `import_total_s` | Steam import of N games with local 600×900 covers |
+| `import_max_gap_ms` | Longest main-loop stall during the import (UI frozen) |
+| `import_gaps_50ms` | Number of stalls longer than 50 ms during the import |
+| `tmp_files_left` | Temporary files left behind (leak) |
 
-Variáveis de diagnóstico: `BENCH_PROFILE=1` (cProfile de `do_activate`),
-`BENCH_STALLS=1` (amostra a pilha da thread principal quando ela trava > 100 ms
-durante a importação), `BENCH_PROFILE_IMPORT=1` (cProfile da importação; no
-Python ≥ 3.12 ele mistura threads, use com cuidado).
+Diagnostic variables: `BENCH_PROFILE=1` (cProfile of `do_activate`),
+`BENCH_STALLS=1` (samples the main thread's stack whenever it stalls > 100 ms
+during the import), `BENCH_PROFILE_IMPORT=1` (cProfile of the import; on
+Python ≥ 3.12 it mixes threads, use with care).
 
-## Limitações
+## Limitations
 
-* **Partida a frio**: os números são com o cache de páginas do kernel quente.
-  Para medir a frio, rode como root `sync; echo 3 > /proc/sys/vm/drop_caches`
-  antes de cada execução (afeta o sistema inteiro).
-* **Broadway ≠ Wayland**: o Broadway não pinta sem um cliente conectado, então
-  o custo de renderização real (GPU) não entra na conta. Layout e alocação de
-  widgets entram.
-* **Flatpak**: não é medido aqui. Procedimento manual:
+* **Cold start**: numbers are taken with a warm kernel page cache. To measure
+  a cold start, run `sync; echo 3 > /proc/sys/vm/drop_caches` as root before
+  each run (affects the whole system).
+* **Broadway ≠ Wayland**: Broadway does not paint without a connected client,
+  so real (GPU) rendering cost is not included. Widget layout and allocation
+  are.
+* **Flatpak**: not measured here. Manual procedure:
   ```sh
   flatpak install --user flathub org.gnome.Sdk//49 org.flatpak.Builder
   flatpak run org.flatpak.Builder --user --install --force-clean \
