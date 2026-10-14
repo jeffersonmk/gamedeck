@@ -20,7 +20,6 @@
 from cartridges import shared
 from cartridges.game import Game
 from cartridges.game_cover import GameCover
-from cartridges.game_widget import GameWidget
 from cartridges.store.managers.manager import Manager
 from cartridges.store.managers.sgdb_manager import SgdbManager
 from cartridges.store.managers.steam_api_manager import SteamAPIManager
@@ -33,23 +32,16 @@ class DisplayManager(Manager):
     signals = {"update-ready"}
 
     def main(self, game: Game, _additional_data: dict) -> None:
-        # The card is created here, on the main thread, never by importers
-        if (widget := game.widget) is None:
-            widget = game.widget = GameWidget(game)
+        # Covers are created without decoding anything: images are loaded
+        # when a card showing them scrolls into view
+        if (game_cover := shared.win.game_covers.get(game.game_id)) is None:
+            game_cover = GameCover(path=game.get_cover_path())
+            shared.win.game_covers[game.game_id] = game_cover
+        game.game_cover = game_cover
 
-        if widget.get_parent():
-            widget.get_parent().get_parent().remove(widget)
-            if widget.get_parent():
-                widget.get_parent().set_child()
-
-        widget.sync()
-
-        if game.game_id in shared.win.game_covers:
-            game.game_cover = shared.win.game_covers[game.game_id]
-            game.game_cover.add_picture(widget.cover)
-        else:
-            game.game_cover = GameCover({widget.cover}, game.get_cover_path())
-            shared.win.game_covers[game.game_id] = game.game_cover
+        # Refresh the card if the game is currently on screen
+        if game.widget:
+            game.widget.sync()
 
         if (
             shared.win.navigation_view.get_visible_page() == shared.win.details_page
@@ -57,18 +49,8 @@ class DisplayManager(Manager):
         ):
             shared.win.show_details_page(game)
 
-        if not game.removed and not game.blacklisted:
-            if game.hidden:
-                shared.win.hidden_library.append(widget)
-            else:
-                shared.win.library.append(widget)
-            widget.get_parent().set_focusable(False)
-
-        # Recomputing the empty/no-results overlay walks the whole library:
-        # skip it while loading from disk (done once afterwards) and
-        # coalesce it otherwise (e.g. hundreds of games added by an import)
-        if shared.win.get_application().state != shared.AppState.LOAD_FROM_DISK:
-            shared.win.queue_set_library_child()
+        # Add, refresh or remove the game in the library views (batched)
+        shared.win.queue_game_update(game)
 
         if shared.win.get_application().state == shared.AppState.DEFAULT:
             shared.win.queue_create_source_rows()

@@ -82,6 +82,13 @@ def _apply_pending() -> bool:
 
 
 class GameCover:
+    """Cover of a game, shared by every `Gtk.Picture` showing it.
+
+    Images are decoded on demand: only when a picture is attached (a card
+    scrolled into view, the details page...) or when `get_texture()` is
+    called. Covers of games that were never shown cost no memory.
+    """
+
     texture: Optional[Gdk.Texture]
     blurred: Optional[Gdk.Texture]
     luminance: Optional[tuple[float, float]]
@@ -96,57 +103,87 @@ class GameCover:
         shared.PREFIX + "/library_placeholder_small.svg"
     )
 
-    def __init__(self, pictures: set[Gtk.Picture], path: Optional[Path] = None) -> None:
-        self.pictures = pictures
+    def __init__(
+        self, pictures: Optional[set[Gtk.Picture]] = None, path: Optional[Path] = None
+    ) -> None:
+        self.pictures = pictures if pictures is not None else set()
         self._anim_source = 0
         self._generation = 0
+        self._loading = False
         self.new_cover(path, initial=True)
 
     def new_cover(self, path: Optional[Path] = None, initial: bool = False) -> None:
         self._generation += 1
+        self._loading = False
+        self._stop_animation()
         self.animation = None
+        self.anim_iter = None
         self.texture = None
         self.blurred = None
         self.luminance = None
         self.path = path
 
-        if path:
-            if path.suffix == ".gif":
-                self.animation = GdkPixbuf.PixbufAnimation.new_from_file(str(path))
-                self.anim_iter = self.animation.get_iter()
-                # Widgets may only be touched from the main thread: start the
-                # animation from the main loop instead of a worker thread
-                GLib.idle_add(self.update_animation, (None, self.animation))
-            else:
-                # Decode in the background so startup isn't blocked by reading
-                # every cover. New covers show the placeholder until ready;
-                # replaced covers keep the old image until the new one is ready.
-                if initial:
-                    self.set_texture(None)
-                generation = self._generation
+        if not self.pictures:
+            return  # Loaded when a picture is attached
 
-                def decode() -> None:
-                    _deliver(self, generation, _load_texture(path))
+        if path and path.suffix != ".gif" and not initial:
+            # Replaced covers keep showing the old image until the new one
+            # is decoded
+            self._load()
+            return
 
-                _decoder().submit(decode)
+        self.set_texture(None)
+        self._load()
+
+    def _load(self) -> None:
+        """Start loading the image (main thread)"""
+        if not self.path or self._loading or self.texture or self.animation:
+            return
+
+        if self.path.suffix == ".gif":
+            try:
+                self.animation = GdkPixbuf.PixbufAnimation.new_from_file(
+                    str(self.path)
+                )
+            except GLib.Error:
                 return
+            self.anim_iter = self.animation.get_iter()
+            self.update_animation((None, self.animation))
+            return
 
-        if not self.animation:
-            self.set_texture(self.texture)
+        # Decode in the background so the UI isn't blocked by reading files
+        self._loading = True
+        generation, path = self._generation, self.path
+
+        def decode() -> None:
+            _deliver(self, generation, _load_texture(path))
+
+        _decoder().submit(decode)
 
     def on_texture_loaded(
         self, generation: int, texture: Optional[Gdk.Texture]
     ) -> None:
         # Ignore results for a cover that has been replaced in the meantime
-        if generation == self._generation and not self.animation:
-            if self.texture is None:
-                self.texture = texture
-            self.set_texture(self.texture)
+        if generation != self._generation or self.animation:
+            return
+        self._loading = False
+        if self.texture is None:
+            self.texture = texture
+        self.set_texture(self.texture)
 
     def get_texture(self) -> Gdk.Texture:
         if self.animation:
             return Gdk.Texture.new_for_pixbuf(self.animation.get_static_image())
         if self.texture is None and self.path:
+            if self.path.suffix == ".gif":
+                try:
+                    return Gdk.Texture.new_for_pixbuf(
+                        GdkPixbuf.PixbufAnimation.new_from_file(
+                            str(self.path)
+                        ).get_static_image()
+                    )
+                except GLib.Error:
+                    return None
             # Needed now (e.g. by the details dialog): don't wait for the pool
             self.texture = _load_texture(self.path)
         return self.texture
@@ -182,39 +219,46 @@ class GameCover:
 
     def add_picture(self, picture: Gtk.Picture) -> None:
         self.pictures.add(picture)
-        if not self.animation:
-            self.set_texture(self.texture)
-        else:
+        if self.animation:
             self.update_animation((None, self.animation))
+            return
+        picture.set_paintable(self.texture or self.placeholder)
+        self._load()
 
-    def set_texture(self, texture: Gdk.Texture) -> None:
-        self.pictures.discard(
-            picture for picture in self.pictures if not picture.is_visible()
-        )
+    def remove_picture(self, picture: Gtk.Picture) -> None:
+        self.pictures.discard(picture)
         if not self.pictures:
-            self.animation = None
-        else:
-            for picture in self.pictures:
-                picture.set_paintable(texture or self.placeholder)
-                picture.queue_draw()
+            # Nothing shows it: stop animating (restarted by add_picture)
+            self._stop_animation()
+
+    def set_texture(self, texture: Optional[Gdk.Texture]) -> None:
+        for picture in self.pictures:
+            picture.set_paintable(texture or self.placeholder)
+            picture.queue_draw()
+
+    def _stop_animation(self) -> None:
+        if self._anim_source:
+            GLib.source_remove(self._anim_source)
+            self._anim_source = 0
 
     def update_animation(self, data: GdkPixbuf.PixbufAnimation) -> None:
-        if self.animation == data[1]:
-            self.anim_iter.advance()  # type: ignore
+        if self.animation != data[1] or not self.pictures:
+            return
 
-            self.set_texture(Gdk.Texture.new_for_pixbuf(self.anim_iter.get_pixbuf()))  # type: ignore
+        self.anim_iter.advance()  # type: ignore
 
-            delay_time = self.anim_iter.get_delay_time()  # type: ignore
+        self.set_texture(Gdk.Texture.new_for_pixbuf(self.anim_iter.get_pixbuf()))  # type: ignore
 
-            # Keep a single timer per cover: every call used to start one more
-            # never-ending chain (e.g. each time the details page was opened)
-            if self._anim_source:
-                GLib.source_remove(self._anim_source)
-            self._anim_source = GLib.timeout_add(
-                20 if delay_time < 20 else delay_time,
-                self._on_animation_timeout,
-                data,
-            )
+        delay_time = self.anim_iter.get_delay_time()  # type: ignore
+
+        # Keep a single timer per cover: every call used to start one more
+        # never-ending chain (e.g. each time the details page was opened)
+        self._stop_animation()
+        self._anim_source = GLib.timeout_add(
+            20 if delay_time < 20 else delay_time,
+            self._on_animation_timeout,
+            data,
+        )
 
     def _on_animation_timeout(self, data: GdkPixbuf.PixbufAnimation) -> bool:
         self._anim_source = 0

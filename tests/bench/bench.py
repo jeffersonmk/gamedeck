@@ -117,7 +117,7 @@ def child(args: argparse.Namespace) -> None:
 
     gi.require_version("Gtk", "4.0")
     gi.require_version("Adw", "1")
-    from gi.repository import Gio, GLib
+    from gi.repository import Gio, GLib, Gtk
 
     Gio.Resource.load(str(pkgdatadir / "cartridges.gresource"))._register()
 
@@ -181,25 +181,49 @@ def child(args: argparse.Namespace) -> None:
     def after_ready(app) -> bool:
         win = shared.win
 
+        # Works with both the old FlowBox library and the GridView one
+        grid = hasattr(win, "library_model")
+
+        def refilter() -> None:
+            if grid:
+                win.library_filter.changed(Gtk.FilterChange.DIFFERENT)
+            else:
+                win.library.invalidate_filter()
+
         # Search: one keystroke worth of synchronous filtering
         win.search_entry.set_text("quest")
+        prof = None
+        if os.environ.get("BENCH_PROFILE_SEARCH"):
+            import cProfile
+
+            prof = cProfile.Profile()
+            prof.enable()
         ts = time.perf_counter()
-        win.library.invalidate_filter()
+        refilter()
         result["search_ms"] = (time.perf_counter() - ts) * 1000
+        if prof:
+            import pstats
+
+            prof.disable()
+            with open(os.environ["BENCH_PROFILE_SEARCH"], "w") as out:
+                pstats.Stats(prof, stream=out).sort_stats("tottime").print_stats(15)
         win.search_entry.set_text("")
-        win.library.invalidate_filter()
+        refilter()
 
         # Sort
         win.sort_state = "a-z"
         ts = time.perf_counter()
-        win.library.invalidate_sort()
+        if grid:
+            win.library_sorter.changed(Gtk.SorterChange.DIFFERENT)
+        else:
+            win.library.invalidate_sort()
         result["sort_ms"] = (time.perf_counter() - ts) * 1000
 
         result["rss_mb_startup"] = rss_mb()
         result["games_loaded"] = len(shared.store)
 
-        # Sanity check: every visible game must have a card in the grid,
-        # otherwise a broken build would show suspiciously good numbers
+        # Sanity check: every visible game must be in the grid, otherwise a
+        # broken build would show suspiciously good numbers
         def n_cards(flowbox) -> int:
             n = 0
             while flowbox.get_child_at_index(n):
@@ -207,7 +231,18 @@ def child(args: argparse.Namespace) -> None:
             return n
 
         shown = sum(not (g.removed or g.blacklisted) for g in shared.store)
-        result["cards"] = n_cards(win.library) + n_cards(win.hidden_library)
+        if grid:
+            result["cards"] = (win.library_model.get_n_items()
+                               + win.hidden_library_model.get_n_items())
+            # Cards actually created (only the visible ones are)
+            from cartridges.game_widget import GameWidget
+
+            result["card_widgets"] = sum(
+                w.game is not None for w in GameWidget.instances)
+            result["window"] = [win.get_width(), win.get_height()]
+        else:
+            result["cards"] = n_cards(win.library) + n_cards(win.hidden_library)
+            result["card_widgets"] = result["cards"]
         if result["cards"] != shown:
             raise SystemExit(f"Only {result['cards']} of {shown} games have a card")
 
@@ -277,8 +312,9 @@ def child(args: argparse.Namespace) -> None:
             # "covers_ready" = every cover texture decoded and shown
             def wait_covers():
                 covers = shared.win.game_covers.values()
+                # Covers on screen (all of them with the old FlowBox)
                 if all(c.texture is not None or c.animation or not c.path
-                       for c in covers):
+                       or not c.pictures for c in covers):
                     result["covers_ready_s"] = time.perf_counter() - t0
                     GLib.timeout_add(100, after_ready, self)
                     return False

@@ -257,7 +257,7 @@ class DetailsDialog(Adw.Dialog):
             sgdb_manager.reset_cancellable()
             sgdb_manager.process_game(self.game, {}, self.update_cover_callback)
 
-        self.game_cover.pictures.remove(self.cover)
+        self.game_cover.remove_picture(self.cover)
 
         self.close()
         shared.win.show_details_page(self.game)

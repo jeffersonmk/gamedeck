@@ -128,7 +128,7 @@ class CartridgesApplication(Adw.Application):
         self.state = shared.AppState.LOAD_FROM_DISK
         self.load_games_from_disk()
         self.state = shared.AppState.DEFAULT
-        shared.win.set_library_child()
+        shared.win.flush_game_updates()
         shared.win.create_source_rows()
 
         # Add rest of the managers for game imports

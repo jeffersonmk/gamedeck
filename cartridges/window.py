@@ -25,8 +25,9 @@ from typing import Any, Optional
 from cartridges import shared
 from cartridges.game import Game
 from cartridges.game_cover import GameCover
+from cartridges.game_widget import GameWidget
 from cartridges.utils.relative_date import relative_date
-from gi.repository import Adw, Gio, GLib, Gtk, Pango
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
 
 @Gtk.Template(resource_path=shared.PREFIX + "/gtk/window.ui")
@@ -47,7 +48,7 @@ class CartridgesWindow(Adw.ApplicationWindow):
     details_view: Gtk.Overlay = Gtk.Template.Child()
     library_page: Adw.NavigationPage = Gtk.Template.Child()
     library_view: Adw.ToolbarView = Gtk.Template.Child()
-    library: Gtk.FlowBox = Gtk.Template.Child()
+    library: Gtk.GridView = Gtk.Template.Child()
     scrolledwindow: Gtk.ScrolledWindow = Gtk.Template.Child()
     library_overlay: Gtk.Overlay = Gtk.Template.Child()
     notice_empty: Adw.StatusPage = Gtk.Template.Child()
@@ -70,7 +71,7 @@ class CartridgesWindow(Adw.ApplicationWindow):
 
     hidden_library_page: Adw.NavigationPage = Gtk.Template.Child()
     hidden_primary_menu_button: Gtk.MenuButton = Gtk.Template.Child()
-    hidden_library: Gtk.FlowBox = Gtk.Template.Child()
+    hidden_library: Gtk.GridView = Gtk.Template.Child()
     hidden_library_view: Adw.ToolbarView = Gtk.Template.Child()
     hidden_scrolledwindow: Gtk.ScrolledWindow = Gtk.Template.Child()
     hidden_library_overlay: Gtk.Overlay = Gtk.Template.Child()
@@ -210,7 +211,7 @@ class CartridgesWindow(Adw.ApplicationWindow):
         self.library_page.set_title(self.get_application().get_source_name(value))
 
         self.filter_state = value
-        self.library.invalidate_filter()
+        self.library_filter.changed(Gtk.FilterChange.DIFFERENT)
         self.set_library_child()
 
         if self.overlay_split_view.get_collapsed():
@@ -234,11 +235,40 @@ class CartridgesWindow(Adw.ApplicationWindow):
         self.details_view.set_measure_overlay(self.details_view_toolbar_view, True)
         self.details_view.set_clip_overlay(self.details_view_toolbar_view, False)
 
-        self.library.set_filter_func(self.filter_func)
-        self.hidden_library.set_filter_func(self.filter_func)
+        # Library views: every displayed game lives once in `games_model`;
+        # each GridView shows a filtered and sorted view of it and only
+        # creates cards for the games on screen
+        self.games_model = Gio.ListStore(item_type=Game)
+        self._model_games: set[Game] = set()
+        self._pending_games: dict[Game, None] = {}
+        self._games_update_queued = False
 
-        self.library.set_sort_func(self.sort_func)
-        self.hidden_library.set_sort_func(self.sort_func)
+        self.library_filter = Gtk.CustomFilter.new(self.filter_func, False)
+        self.hidden_library_filter = Gtk.CustomFilter.new(self.filter_func, True)
+        self.library_sorter = Gtk.CustomSorter.new(self.sort_func)
+        # Sorted once, then filtered: typing in the search box only re-runs
+        # the (cheap) filter, never the sort
+        self.sorted_games = Gtk.SortListModel(
+            model=self.games_model, sorter=self.library_sorter
+        )
+        self.library_model = Gtk.FilterListModel(
+            model=self.sorted_games, filter=self.library_filter
+        )
+        self.hidden_library_model = Gtk.FilterListModel(
+            model=self.sorted_games, filter=self.hidden_library_filter
+        )
+        for view, model in (
+            (self.library, self.library_model),
+            (self.hidden_library, self.hidden_library_model),
+        ):
+            view.set_model(Gtk.NoSelection(model=model))
+            view.set_factory(self.create_card_factory())
+
+            # Arrow keys move between cards, as they did with the FlowBox
+            keys = Gtk.EventControllerKey()
+            keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            keys.connect("key-pressed", self.on_library_key_pressed, view, model)
+            view.add_controller(keys)
 
         self.set_library_child()
 
@@ -273,27 +303,164 @@ class CartridgesWindow(Adw.ApplicationWindow):
         style_manager.connect("notify::dark", self.set_details_view_opacity)
         style_manager.connect("notify::high-contrast", self.set_details_view_opacity)
 
-        # Allow for a custom number of rows for the library
-        if shared.schema.get_uint("library-rows"):
-            shared.schema.bind(
-                "library-rows",
-                self.library,
-                "max-children-per-line",
-                Gio.SettingsBindFlags.DEFAULT,
+        # Columns: as many cards as fit, up to "library-rows" (default 10).
+        # GridView keeps ~30 rows of cards per column alive, so its column
+        # limit must match what is really shown, not a fixed maximum
+        self._grid_padding: dict[str, int] = {}
+        self._grid_css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            self._grid_css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        )
+        self.library.set_name("library")
+        self.hidden_library.set_name("hidden-library")
+        for scrolled_window, view in (
+            (self.scrolledwindow, self.library),
+            (self.hidden_scrolledwindow, self.hidden_library),
+        ):
+            scrolled_window.get_hadjustment().connect(
+                "changed", self.update_columns, view
             )
-            shared.schema.bind(
-                "library-rows",
-                self.hidden_library,
-                "max-children-per-line",
-                Gio.SettingsBindFlags.DEFAULT,
+        shared.schema.connect("changed::library-rows", self.on_library_rows_changed)
+
+    CARD_WIDTH = 200 + 12  # Card plus spacing, see style.css
+    GRID_PADDING = 2 * 9
+
+    def update_columns(self, _adjustment: Any, view: Gtk.GridView) -> None:
+        # The scrolled window's width doesn't depend on the view's margins
+        width = view.get_parent().get_width()
+        if width <= 0:
+            return
+        limit = shared.schema.get_uint("library-rows") or 10
+        columns = max(1, min(limit, (width - self.GRID_PADDING) // self.CARD_WIDTH))
+        if view.get_max_columns() != columns:
+            view.set_max_columns(columns)
+
+        # GridView spreads the leftover width between the columns; keep the
+        # cards together and centered like the FlowBox did instead. Widget
+        # margins are ignored inside a ScrolledWindow, CSS padding is not
+        padding = max(0, width - self.GRID_PADDING - columns * self.CARD_WIDTH) // 2
+        if self._grid_padding.get(view.get_name()) != padding:
+            self._grid_padding[view.get_name()] = padding
+            self._grid_css.load_from_string(
+                "".join(
+                    f"gridview#{name} {{ padding-left: {9 + pad}px;"
+                    f" padding-right: {9 + pad}px; }}"
+                    for name, pad in self._grid_padding.items()
+                )
             )
-        else:
-            self.library.set_max_children_per_line(10)
-            self.hidden_library.set_max_children_per_line(10)
+
+    def on_library_rows_changed(self, *_args: Any) -> None:
+        for scrolled_window, view in (
+            (self.scrolledwindow, self.library),
+            (self.hidden_scrolledwindow, self.hidden_library),
+        ):
+            self.update_columns(scrolled_window.get_hadjustment(), view)
+
+    @staticmethod
+    def create_card_factory() -> Gtk.SignalListItemFactory:
+        def setup(_factory: Any, list_item: Gtk.ListItem) -> None:
+            list_item.set_child(GameWidget())
+            # Focus goes to the card's buttons, as with the old FlowBox
+            list_item.set_focusable(False)
+            list_item.set_activatable(False)
+
+        def bind(_factory: Any, list_item: Gtk.ListItem) -> None:
+            list_item.get_child().bind(list_item.get_item(), list_item)
+
+        def unbind(_factory: Any, list_item: Gtk.ListItem) -> None:
+            list_item.get_child().unbind()
+
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", setup)
+        factory.connect("bind", bind)
+        factory.connect("unbind", unbind)
+        return factory
+
+    ARROW_KEYS = {
+        Gdk.KEY_Left: (-1, 0),
+        Gdk.KEY_Right: (1, 0),
+        Gdk.KEY_Up: (0, -1),
+        Gdk.KEY_Down: (0, 1),
+    }
+
+    def on_library_key_pressed(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        state: Gdk.ModifierType,
+        view: Gtk.GridView,
+        model: Gio.ListModel,
+    ) -> bool:
+        if keyval not in self.ARROW_KEYS or state & Gtk.accelerator_get_default_mod_mask():
+            return False
+
+        card = self.get_focus()
+        while card and not isinstance(card, GameWidget):
+            card = card.get_parent()
+        if not card or not card.list_item:
+            return False
+
+        step, rows = self.ARROW_KEYS[keyval]
+        if self.get_direction() == Gtk.TextDirection.RTL:
+            step = -step
+        position = card.list_item.get_position() + step + rows * view.get_max_columns()
+        if not 0 <= position < model.get_n_items():
+            return False  # Let focus leave the grid at its edges
+
+        view.scroll_to(position, Gtk.ListScrollFlags.NONE, None)
+        if (widget := model.get_item(position).widget) is not None:
+            widget.cover_button.grab_focus()
+        return True
+
+    def queue_game_update(self, game: Game) -> None:
+        """Add, refresh or remove a game in the library views (batched)"""
+        self._pending_games[game] = None
+        if self._games_update_queued:
+            return
+        self._games_update_queued = True
+        # Default priority: idle callbacks can be starved by redraws
+        GLib.idle_add(self.flush_game_updates, priority=GLib.PRIORITY_DEFAULT)
+
+    def flush_game_updates(self) -> bool:
+        self._games_update_queued = False
+        if not self._pending_games:
+            return False
+
+        games, new = list(self._pending_games), []
+        self._pending_games.clear()
+
+        for game in games:
+            show = not game.removed and not game.blacklisted
+            present = game in self._model_games
+            if show and not present:
+                new.append(game)
+                self._model_games.add(game)
+            elif present:
+                found, position = self.games_model.find(game)
+                if not found:
+                    continue
+                if show:
+                    # Replacing the item re-runs the filters and sorters for it
+                    self.games_model.splice(position, 1, [game])
+                else:
+                    self.games_model.remove(position)
+                    self._model_games.discard(game)
+
+        if new:
+            # One insertion for the whole batch (e.g. the library at startup)
+            self.games_model.splice(self.games_model.get_n_items(), 0, new)
+
+        self.set_library_child()
+        return False
 
     def search_changed(self, _widget: Any, hidden: bool) -> None:
         # Refresh search filter on keystroke in search box
-        (self.hidden_library if hidden else self.library).invalidate_filter()
+        (self.hidden_library_filter if hidden else self.library_filter).changed(
+            Gtk.FilterChange.DIFFERENT
+        )
         self.set_library_child()
 
     def queue_set_library_child(self) -> None:
@@ -323,51 +490,52 @@ class CartridgesWindow(Adw.ApplicationWindow):
         GLib.idle_add(run)
 
     def on_cover_launches_game_changed(self, *_args: Any) -> None:
-        for game in shared.store:
-            if game.widget:
-                game.widget.set_play_icon()
+        for widget in GameWidget.instances:
+            widget.set_play_icon()
 
     def set_library_child(self) -> None:
-        child, hidden_child = self.notice_empty, self.hidden_notice_empty
-
-        for game in shared.store:
-            if game.removed or game.blacklisted:
-                continue
-            if game.hidden:
-                if game.filtered and hidden_child:
-                    hidden_child = self.hidden_notice_no_results
-                    continue
-                hidden_child = None
-            else:
-                if game.filtered and child:
-                    child = self.notice_no_results
-                    continue
-                child = None
+        """Show the "no games" or "no results" notice when needed"""
+        n_hidden = sum(game.hidden for game in self._model_games)
+        n_visible = len(self._model_games) - n_hidden
 
         def remove_from_overlay(widget: Gtk.Widget) -> None:
-            if isinstance(widget.get_parent(), Gtk.Overlay):
-                widget.get_parent().remove_overlay(widget)
+            if isinstance(parent := widget.get_parent(), Gtk.Overlay):
+                parent.remove_overlay(widget)
 
-        if child:
-            self.library_overlay.add_overlay(child)
-        else:
-            remove_from_overlay(self.notice_empty)
-            remove_from_overlay(self.notice_no_results)
-
-        if hidden_child:
-            self.hidden_library_overlay.add_overlay(hidden_child)
-        else:
-            remove_from_overlay(self.hidden_notice_empty)
-            remove_from_overlay(self.hidden_notice_no_results)
-
-    def filter_func(self, child: Gtk.Widget) -> bool:
-        game = child.get_child().game
-        text = (
+        for overlay, n_games, model, empty, no_results in (
             (
-                self.hidden_search_entry
-                if self.navigation_view.get_visible_page() == self.hidden_library_page
-                else self.search_entry
-            )
+                self.library_overlay,
+                n_visible,
+                self.library_model,
+                self.notice_empty,
+                self.notice_no_results,
+            ),
+            (
+                self.hidden_library_overlay,
+                n_hidden,
+                self.hidden_library_model,
+                self.hidden_notice_empty,
+                self.hidden_notice_no_results,
+            ),
+        ):
+            child = None
+            if not n_games:
+                child = empty
+            elif not model.get_n_items():
+                child = no_results
+
+            for notice in (empty, no_results):
+                if notice is not child:
+                    remove_from_overlay(notice)
+            if child and child.get_parent() is None:
+                overlay.add_overlay(child)
+
+    def filter_func(self, game: Game, hidden: bool) -> bool:
+        if game.hidden != hidden:
+            return False
+
+        text = (
+            (self.hidden_search_entry if hidden else self.search_entry)
             .get_text()
             .lower()
         )
@@ -407,7 +575,7 @@ class CartridgesWindow(Adw.ApplicationWindow):
         self.details_view_hide_button.set_tooltip_text(text)
 
         if self.details_view_game_cover:
-            self.details_view_game_cover.pictures.remove(self.details_view_cover)
+            self.details_view_game_cover.remove_picture(self.details_view_cover)
 
         self.details_view_game_cover = game.game_cover
         self.details_view_game_cover.add_picture(self.details_view_cover)
@@ -454,7 +622,7 @@ class CartridgesWindow(Adw.ApplicationWindow):
             else self.details_view_game_cover.luminance[1]  # type: ignore
         )
 
-    def sort_func(self, child1: Gtk.Widget, child2: Gtk.Widget) -> int:
+    def sort_func(self, game1: Game, game2: Game, *_args: Any) -> int:
         var, order = "name", True
 
         if self.sort_state in ("newest", "oldest"):
@@ -464,8 +632,6 @@ class CartridgesWindow(Adw.ApplicationWindow):
         elif self.sort_state == "a-z":
             order = False
 
-        game1, game2 = child1.get_child().game, child2.get_child().game
-
         def get_value(game: Game, attr: str) -> str:
             return str(getattr(game, attr)).lower().removeprefix("the ")
 
@@ -474,6 +640,9 @@ class CartridgesWindow(Adw.ApplicationWindow):
         if var != "name" and value1 == value2:
             var, order = "name", False
             value1, value2 = get_value(game1, var), get_value(game2, var)
+
+        if value1 == value2:
+            return 0
 
         return ((value1 > value2) ^ order) * 2 - 1
 
@@ -504,7 +673,7 @@ class CartridgesWindow(Adw.ApplicationWindow):
     def on_sort_action(self, action: Gio.SimpleAction, state: GLib.Variant) -> None:
         action.set_state(state)
         self.sort_state = str(state).strip("'")
-        self.library.invalidate_sort()
+        self.library_sorter.changed(Gtk.SorterChange.DIFFERENT)
 
         shared.state_schema.set_string("sort-mode", self.sort_state)
 
@@ -526,20 +695,13 @@ class CartridgesWindow(Adw.ApplicationWindow):
         search_entry.set_text("")
 
     def show_details_page_search(self, widget: Gtk.Widget) -> None:
-        library = (
-            self.hidden_library if widget == self.hidden_search_entry else self.library
+        model = (
+            self.hidden_library_model
+            if widget == self.hidden_search_entry
+            else self.library_model
         )
-        index = 0
-
-        while True:
-            if not (child := library.get_child_at_index(index)):
-                break
-
-            if self.filter_func(child):
-                self.show_details_page(child.get_child().game)
-                break
-
-            index += 1
+        if game := model.get_item(0):
+            self.show_details_page(game)
 
     def on_undo_action(
         self, _widget: Any, game: Optional[Game] = None, undo: Optional[str] = None

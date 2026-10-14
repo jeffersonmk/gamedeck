@@ -72,7 +72,7 @@ Legend: **[C]** proven by code, **[M]** proven by measurement,
 | 12 | One `schema.changed` connection **per game**, never disconnected | [C] `game.py` | removed games stay alive in memory; O(n) cost on every settings change | **fixed** (single handler) |
 | 13 | 2 DEBUG log lines per game written to the log file on every startup | [M] 0.22 s / 2000 games | startup | **fixed** (one summary line) |
 | 14 | `Game` widgets are **created in import threads** | [C] sources instantiate `Game` (a `Gtk.Box`) inside `Gio.Task.run_in_thread` | violates GTK threading rules | **fixed** in step 2 ([M] 50 → 0 widgets created off the main thread) |
-| 15 | Non-virtualized grid: one widget + one texture per game | [M] 682 MB RSS with 2000 games; ~1.3 s initial layout | memory and startup scale linearly | **open** — `GridView` (roadmap) |
+| 15 | Non-virtualized grid: one widget + one texture per game | [M] 682 MB RSS with 2000 games; ~1.3 s initial layout | memory and startup scale linearly | **fixed** in step 3 (682 → 189 MB, 129 cards instead of 2000) |
 | 16 | Flatpak uses `--filesystem=host` (read **and write**) | [C] manifest; `rewrite` already uses `host:ro` | more permission than needed | **open** — recommendation, not tested here |
 | 17 | Games are launched with `flatpak-spawn --host sh -c` | [C] `run_executable.py` | the sandbox is bypassed by design (required to start host games); commands come from the user's local files | accepted (documented) |
 | 18 | `set_texture` calls `discard(<generator>)`, which removes nothing | [C] `game_cover.py` | pruning of invisible pictures never worked | **unchanged** — "fixing" it would change behavior without visual testing |
@@ -117,7 +117,7 @@ Python code (e.g. parsing huge Steam libraries).
 |---|---|---|---|
 | 1 ✅ | Low-risk fixes (items 1–13) | low | tests pass; no time regression in the benchmark; 0 temp files left |
 | 2 ✅ | Split `Game` (plain `GObject` model) from `GameWidget`; sources create models only | medium | no widget created off the main thread (checkable with a debug `assert`); all 9 sources import |
-| 3 | Replace `FlowBox` with `Gtk.GridView` + `Gtk.FilterListModel`/`SortListModel` | medium | RSS with 2000 games < 300 MB; `covers_ready_s` < 1 s; keyboard navigation and screen reader support preserved |
+| 3 ✅ | Replace `FlowBox` with `Gtk.GridView` + `Gtk.FilterListModel`/`SortListModel` | medium | RSS with 2000 games < 300 MB; `covers_ready_s` < 1 s; keyboard navigation and screen reader support preserved |
 | 4 | Size-bounded texture cache (LRU by bytes) loaded on demand by the `GridView` | low | stable memory over prolonged use (open/close details 1000×) |
 | 5 | Flatpak: `--filesystem=host` → `host:ro`; CI on the GNOME 49 image | low | Flatpak build + import from every source + changing a cover all work |
 | 6 | Evaluate Rust **only** for a measured bottleneck | — | a profile showing > 100 ms of Python CPU on a hot path |
@@ -189,6 +189,63 @@ machine; their importer code is unchanged and they only depend on the `Game`
 constructor, which is covered by unit tests (including creation in a worker
 thread).
 
+## 6c. Step 3 — virtualized grid
+
+Both library pages are now `Gtk.GridView`s over one `Gio.ListStore` of games
+(`window.games_model`), sorted once (`SortListModel`) and then filtered
+(`FilterListModel`), so typing in the search box never re-sorts.
+
+* Cards are created only for the rows on screen plus a small margin and are
+  recycled while scrolling (`GameWidget.bind()` / `unbind()`).
+* Covers are decoded only when a card showing them exists (`GameCover` loads
+  on `add_picture()`); GIF timers stop when no card shows the cover.
+* The card menu (popover) is built the first time it is opened.
+* Store updates are batched into one model change per main-loop iteration
+  (`queue_game_update()` / `flush_game_updates()`).
+* The number of columns follows the window width (capped by the existing
+  `library-rows` setting) and the grid is centered with the same 12 px gaps
+  as before (padding set through CSS: widget margins are ignored inside a
+  `ScrolledWindow`). `GridView` keeps ~30 rows per column alive, so a fixed
+  `max-columns: 10` would have kept 300 cards alive in a narrow window.
+* Arrow keys move between cards as with the FlowBox (`on_library_key_pressed`),
+  scrolling the grid when needed.
+
+**Results** (median of 3 runs; headless benchmark = `tests/bench`, real
+display = Hyprland, 951×1028 window, same 2000-game library)
+
+| Metric, 2000 games | Step 2 | Step 3 | Target |
+|---|---:|---:|---:|
+| Card widgets alive | 2000 | **129** | — |
+| Window ready (headless) | 2.25 s | **0.71 s** | — |
+| All visible covers ready (headless) | 3.56 s | **0.80 s** | < 1 s ✅ |
+| RSS after startup (headless) | 682 MB | **189 MB** | < 300 MB ✅ |
+| RSS after importing 300 games (headless) | 800 MB | **252 MB** | — |
+| First frame on the real display | 5.0–5.2 s | **1.5–1.6 s** | — |
+| RSS settled on the real display | 886–901 MB | **235–259 MB** | — |
+| Longest UI freeze while importing 300 games | 486 ms | **138 ms** | — |
+| Sort | 44 ms | **13 ms** | — |
+| Search keystroke, filter only (headless) | 14 ms | 23 ms | — |
+| Search keystroke to painted frame (real display) | 26 ms | 31 ms (max 80) | — |
+
+Search got slightly slower per keystroke because each change creates the
+cards for the new results; it stays well under one 60 Hz frame on average.
+With 100 games every metric is the same or better.
+
+**Verification**: 25 unit tests (4 new: lazy cover decoding, GIF timer stops,
+card bind/unbind, menu built for the bound game; they fail on step 2). The
+benchmark checks that the models contain every visible game. Real import on
+the dev machine: identical games, names and commands to step 2, 0 widgets
+created off the main thread. Real display: grid, scrolling to the end,
+keyboard navigation (Down/Right/Up/Left and 20× Down with scrolling), hide →
+hidden page → unhide, search, "no results" notice and details page, 0 errors.
+
+Screenshots are rendered offscreen (GDK Broadway, the window's own widgets),
+including the card menu (Edit / Hide / Remove, and Unhide on the hidden page)
+and a narrow window (3 columns, centered).
+
+**Not verified**: screen reader (Orca) behaviour, and the card menu opened
+with a real mouse click.
+
 ## 7. Known limitations
 
 * **+25–30 MB RSS after importing**: covers are now processed in parallel in
@@ -198,7 +255,7 @@ thread).
 * More short freezes (> 50 ms) when importing 300 games: the work went from a
   single 2.6 s block to several smaller chunks (GIL contention + widget
   creation). Steps 2 and 3 address this.
-* Items 15–22 of the findings table remain open.
+* Items 16–22 of the findings table remain open.
 * Not measured here: cold start (needs root), Flatpak (needs the GNOME 49 SDK
   and flatpak-builder) and real GPU rendering (the benchmark uses Broadway).
   Procedures in `tests/bench/README.md`.

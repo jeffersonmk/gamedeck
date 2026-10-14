@@ -355,3 +355,81 @@ class GameModelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LazyCoverTests(unittest.TestCase):
+    """Step 3: covers are only decoded for games that are on screen."""
+
+    def setUp(self):
+        from cartridges import game_cover
+
+        self.gc = game_cover
+        self.dir = TMP / "covers-test"
+        self.dir.mkdir(exist_ok=True)
+
+    def test_cover_is_not_decoded_until_shown(self):
+        path = self.dir / "lazy.tiff"
+        Image.new("RGB", (20, 30)).save(path)
+        cover = self.gc.GameCover(path=path)
+        iterate_main_loop(timeout=0.3)
+        self.assertIsNone(cover.texture)
+
+        picture = FakePicture()
+        cover.add_picture(picture)
+        iterate_main_loop(until=lambda: cover.texture is not None, timeout=5)
+        self.assertEqual(picture.paintables[-1].get_width(), 20)
+
+    def test_animation_stops_without_pictures(self):
+        path = self.dir / "anim2.gif"
+        frames = [Image.new("RGB", (20, 30), c) for c in ("red", "blue")]
+        frames[0].save(path, save_all=True, append_images=frames[1:],
+                       duration=100, loop=0)
+        picture = FakePicture()
+        cover = self.gc.GameCover({picture}, path)
+        self.assertTrue(cover._anim_source)
+        cover.remove_picture(picture)
+        self.assertFalse(cover._anim_source)
+        cover.add_picture(picture)
+        self.assertTrue(cover._anim_source)
+        cover.remove_picture(picture)
+
+
+class GameWidgetTests(unittest.TestCase):
+    """Step 3: cards are recycled between games by the GridView."""
+
+    def setUp(self):
+        from gi.repository import Adw
+
+        Adw.init()  # the card template uses libadwaita widgets
+        from cartridges.game import Game
+        from cartridges.game_widget import GameWidget
+
+        self.games = [
+            Game({"game_id": f"t_{i}", "source": "t", "name": f"Game {i}",
+                  "executable": "true", "hidden": i == 1})
+            for i in range(2)
+        ]
+        self.card = GameWidget()
+
+    def test_bind_unbind(self):
+        a, b = self.games
+        self.card.bind(a)
+        self.assertIs(a.widget, self.card)
+        self.assertEqual(self.card.title.get_label(), "Game 0")
+        self.card.unbind()
+        self.assertIsNone(a.widget)
+        self.card.bind(b)
+        self.assertEqual(self.card.title.get_label(), "Game 1")
+        self.assertIsNone(a.widget)
+
+    def test_menu_is_built_on_demand_for_the_bound_game(self):
+        a, b = self.games
+        self.card.bind(a)
+        self.assertIsNone(self.card.menu_button.get_menu_model())
+        self.card.create_menu(self.card.menu_button)
+        self.assertIs(self.card.menu_button.get_menu_model(), self.card.game_options)
+        self.card.unbind()
+        self.card.bind(b)  # hidden game: the menu has "Unhide"
+        self.card.create_menu(self.card.menu_button)
+        self.assertIs(self.card.menu_button.get_menu_model(),
+                      self.card.hidden_game_options)
