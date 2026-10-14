@@ -20,6 +20,7 @@
 from cartridges import shared
 from cartridges.game import Game
 from cartridges.game_cover import GameCover
+from cartridges.game_widget import GameWidget
 from cartridges.store.managers.manager import Manager
 from cartridges.store.managers.sgdb_manager import SgdbManager
 from cartridges.store.managers.steam_api_manager import SteamAPIManager
@@ -32,29 +33,22 @@ class DisplayManager(Manager):
     signals = {"update-ready"}
 
     def main(self, game: Game, _additional_data: dict) -> None:
-        if game.get_parent():
-            game.get_parent().get_parent().remove(game)
-            if game.get_parent():
-                game.get_parent().set_child()
+        # The card is created here, on the main thread, never by importers
+        if (widget := game.widget) is None:
+            widget = game.widget = GameWidget(game)
 
-        game.menu_button.set_menu_model(
-            game.hidden_game_options if game.hidden else game.game_options
-        )
+        if widget.get_parent():
+            widget.get_parent().get_parent().remove(widget)
+            if widget.get_parent():
+                widget.get_parent().set_child()
 
-        game.title.set_label(game.name)
-
-        game.menu_button.get_popover().connect(
-            "notify::visible", game.toggle_play, None
-        )
-        game.menu_button.get_popover().connect(
-            "notify::visible", shared.win.set_active_game, game
-        )
+        widget.sync()
 
         if game.game_id in shared.win.game_covers:
             game.game_cover = shared.win.game_covers[game.game_id]
-            game.game_cover.add_picture(game.cover)
+            game.game_cover.add_picture(widget.cover)
         else:
-            game.game_cover = GameCover({game.cover}, game.get_cover_path())
+            game.game_cover = GameCover({widget.cover}, game.get_cover_path())
             shared.win.game_covers[game.game_id] = game.game_cover
 
         if (
@@ -65,10 +59,10 @@ class DisplayManager(Manager):
 
         if not game.removed and not game.blacklisted:
             if game.hidden:
-                shared.win.hidden_library.append(game)
+                shared.win.hidden_library.append(widget)
             else:
-                shared.win.library.append(game)
-            game.get_parent().set_focusable(False)
+                shared.win.library.append(widget)
+            widget.get_parent().set_focusable(False)
 
         # Recomputing the empty/no-results overlay walks the whole library:
         # skip it while loading from disk (done once afterwards) and

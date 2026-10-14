@@ -71,13 +71,15 @@ Legend: **[C]** proven by code, **[M]** proven by measurement,
 | 11 | A corrupt cover prevented the game from being shown | [C] `Gdk.Texture.new_from_filename` without `try` inside `DisplayManager` | game disappears from the grid | **fixed** |
 | 12 | One `schema.changed` connection **per game**, never disconnected | [C] `game.py` | removed games stay alive in memory; O(n) cost on every settings change | **fixed** (single handler) |
 | 13 | 2 DEBUG log lines per game written to the log file on every startup | [M] 0.22 s / 2000 games | startup | **fixed** (one summary line) |
-| 14 | `Game` widgets are **created in import threads** | [C] sources instantiate `Game` (a `Gtk.Box`) inside `Gio.Task.run_in_thread` | violates GTK threading rules | **open** — needs model/widget split (roadmap step 2) |
+| 14 | `Game` widgets are **created in import threads** | [C] sources instantiate `Game` (a `Gtk.Box`) inside `Gio.Task.run_in_thread` | violates GTK threading rules | **fixed** in step 2 ([M] 50 → 0 widgets created off the main thread) |
 | 15 | Non-virtualized grid: one widget + one texture per game | [M] 682 MB RSS with 2000 games; ~1.3 s initial layout | memory and startup scale linearly | **open** — `GridView` (roadmap) |
 | 16 | Flatpak uses `--filesystem=host` (read **and write**) | [C] manifest; `rewrite` already uses `host:ro` | more permission than needed | **open** — recommendation, not tested here |
 | 17 | Games are launched with `flatpak-spawn --host sh -c` | [C] `run_executable.py` | the sandbox is bypassed by design (required to start host games); commands come from the user's local files | accepted (documented) |
 | 18 | `set_texture` calls `discard(<generator>)`, which removes nothing | [C] `game_cover.py` | pruning of invisible pictures never worked | **unchanged** — "fixing" it would change behavior without visual testing |
 | 19 | `retryable_on` uses Python's builtin `ConnectionError` and compares exact types | [C] | `requests` connection errors are not retried | [H] real impact not measured |
 | 20 | A cover chosen in the details dialog leaves 1 temporary file | [C] `details_dialog.py` | minor, once per user action | open (low) |
+| 21 | The Blueprint build target outputs `.`, so ninja never recompiles `.ui` files after a `.blp` edit | [C] `data/meson.build`; [M] stale `game.ui` after editing `game.blp` | developers test a stale UI | open — workaround: `rm -rf _build` and set up again |
+| 22 | Heroic logs 4 ERROR lines + tracebacks when a store simply has no installed games | [M] real import on this machine | noisy logs, looks like a failure | open (low) |
 
 **Security/packaging:** no secrets in the code; the SteamGridDB key is stored
 in GSettings (`sgdb-key`). `.desktop` entries are passed through `shlex.quote`.
@@ -114,7 +116,7 @@ Python code (e.g. parsing huge Steam libraries).
 | Step | Change | Risk | Done when |
 |---|---|---|---|
 | 1 ✅ | Low-risk fixes (items 1–13) | low | tests pass; no time regression in the benchmark; 0 temp files left |
-| 2 | Split `Game` (plain `GObject` model) from `GameWidget`; sources create models only | medium | no widget created off the main thread (checkable with a debug `assert`); all 9 sources import |
+| 2 ✅ | Split `Game` (plain `GObject` model) from `GameWidget`; sources create models only | medium | no widget created off the main thread (checkable with a debug `assert`); all 9 sources import |
 | 3 | Replace `FlowBox` with `Gtk.GridView` + `Gtk.FilterListModel`/`SortListModel` | medium | RSS with 2000 games < 300 MB; `covers_ready_s` < 1 s; keyboard navigation and screen reader support preserved |
 | 4 | Size-bounded texture cache (LRU by bytes) loaded on demand by the `GridView` | low | stable memory over prolonged use (open/close details 1000×) |
 | 5 | Flatpak: `--filesystem=host` → `host:ro`; CI on the GNOME 49 image | low | Flatpak build + import from every source + changing a cover all work |
@@ -158,6 +160,35 @@ Median of 5 runs, same synthetic library, release build.
 | RSS after import | 146 MB | 177 MB | **+21%** (see limitations) |
 | Temp files left behind | 100 | 0 | -100% |
 
+## 6b. Step 2 — model/widget split
+
+`Game` is now a plain `GObject.Object` (data + actions). The library card is
+`GameWidget` (`cartridges/game_widget.py`, template `data/gtk/game.blp`),
+created lazily by `DisplayManager` on the main thread and kept in
+`game.widget`. Window code reads the game through `child.get_child().game`.
+The card's menu popover is only rebuilt when the menu actually changes
+(hidden ↔ visible) instead of on every update. Importers were not changed.
+
+**Verification**
+
+| Check | Step 1 | Step 2 |
+|---|---:|---:|
+| Widgets created off the main thread, import of 50 synthetic Steam games | 50 | **0** |
+| Widgets created off the main thread, real import on the dev machine (Steam, Heroic, Flatpak, Desktop) | 25 | **0** |
+| Real import: games, names and commands per source | 7 Steam + 9 Desktop | identical |
+| Cards in the grid (benchmark, 2000 games) | 2000 | 2000 |
+| Hide → hidden page → unhide, card menu, search, details (real display) | — | 0 errors |
+
+Performance is unchanged within noise (median of 3 runs, 2000 games: window
+ready 2.30 s → 2.34 s, all covers 3.59 s → 3.66 s, RSS 681 → 683 MB). This step
+is a prerequisite for step 3 (`GridView`), which is where the memory and
+startup gains are expected.
+
+Lutris, Bottles, itch, Legendary and RetroArch are not installed on the dev
+machine; their importer code is unchanged and they only depend on the `Game`
+constructor, which is covered by unit tests (including creation in a worker
+thread).
+
 ## 7. Known limitations
 
 * **+25–30 MB RSS after importing**: covers are now processed in parallel in
@@ -167,7 +198,7 @@ Median of 5 runs, same synthetic library, release build.
 * More short freezes (> 50 ms) when importing 300 games: the work went from a
   single 2.6 s block to several smaller chunks (GIL contention + widget
   creation). Steps 2 and 3 address this.
-* Items 14–20 of the findings table remain open.
+* Items 15–22 of the findings table remain open.
 * Not measured here: cold start (needs root), Flatpak (needs the GNOME 49 SDK
   and flatpak-builder) and real GPU rendering (the benchmark uses Broadway).
   Procedures in `tests/bench/README.md`.

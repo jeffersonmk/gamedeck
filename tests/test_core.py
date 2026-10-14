@@ -310,5 +310,48 @@ class GameCoverTests(unittest.TestCase):
         self.assertLessEqual(len(ticks), 8)
 
 
+class GameModelTests(unittest.TestCase):
+    """The model must be safe to create in import threads (no widgets)."""
+
+    DATA = {"game_id": "steam_1", "source": "steam", "name": "A",
+            "executable": ["steam", "-applaunch", "1"], "added": 1}
+
+    def test_game_is_not_a_widget(self):
+        from gi.repository import Gtk
+        from cartridges.game import Game
+
+        game = Game(dict(self.DATA))
+        self.assertNotIsInstance(game, Gtk.Widget)
+        self.assertIsNone(game.widget)
+        self.assertEqual(game.executable, "steam -applaunch 1")
+        self.assertEqual(game.base_source, "steam")
+
+    def test_game_can_be_created_in_a_worker_thread(self):
+        from cartridges.game import Game
+
+        shared.win = None  # importers must not need the window either
+        result, errors = [], []
+
+        def work():
+            try:
+                result.append(Game(dict(self.DATA)))
+            except Exception as error:  # pylint: disable=broad-exception-caught
+                errors.append(error)
+
+        worker = threading.Thread(target=work)
+        worker.start()
+        worker.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0].name, "A")
+
+    def test_set_loading_without_widget(self):
+        from cartridges.game import Game
+
+        game = Game(dict(self.DATA))
+        game.set_loading(1)
+        game.set_loading(-1)
+        self.assertEqual(game.loading, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

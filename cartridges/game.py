@@ -20,30 +20,28 @@
 import shlex
 from pathlib import Path
 from time import time
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from gi.repository import Adw, GObject, Gtk
+from gi.repository import Adw, GObject
 
 from cartridges import shared
 from cartridges.game_cover import GameCover
 from cartridges.utils.run_executable import run_executable
 
+if TYPE_CHECKING:
+    from cartridges.game_widget import GameWidget
+
 
 # pylint: disable=too-many-instance-attributes
-@Gtk.Template(resource_path=shared.PREFIX + "/gtk/game.ui")
-class Game(Gtk.Box):
-    __gtype_name__ = "Game"
+class Game(GObject.Object):
+    """A game in the library: data and actions only, no widgets.
 
-    title = Gtk.Template.Child()
-    play_button = Gtk.Template.Child()
-    cover = Gtk.Template.Child()
-    spinner = Gtk.Template.Child()
-    cover_button = Gtk.Template.Child()
-    menu_button = Gtk.Template.Child()
-    play_revealer = Gtk.Template.Child()
-    menu_revealer = Gtk.Template.Child()
-    game_options = Gtk.Template.Child()
-    hidden_game_options = Gtk.Template.Child()
+    Import sources create games in worker threads, so this class must not
+    create or touch GTK widgets. The library card (`GameWidget`) is created
+    lazily on the main thread by the DisplayManager and stored in `widget`.
+    """
+
+    __gtype_name__ = "Game"
 
     loading: int = 0
     filtered: bool = False
@@ -61,23 +59,19 @@ class Game(Gtk.Box):
     game_cover: GameCover = None
     version: int = 0
 
+    widget: Optional["GameWidget"] = None
+
     def __init__(self, data: dict[str, Any], **kwargs: Any) -> None:
         super().__init__(**kwargs)
 
-        self.app = shared.win.get_application()
         self.version = shared.SPEC_VERSION
 
         self.update_values(data)
         self.base_source = self.source.split("_")[0]
 
-        self.set_play_icon()
-
-        self.event_contoller_motion = Gtk.EventControllerMotion.new()
-        self.add_controller(self.event_contoller_motion)
-        self.event_contoller_motion.connect("enter", self.toggle_play, False)
-        self.event_contoller_motion.connect("leave", self.toggle_play, None, None)
-        self.cover_button.connect("clicked", self.main_button_clicked, False)
-        self.play_button.connect("clicked", self.main_button_clicked, True)
+    @property
+    def app(self) -> Any:
+        return shared.win.get_application()
 
     def update_values(self, data: dict[str, Any]) -> None:
         for key, value in data.items():
@@ -151,11 +145,10 @@ class Game(Gtk.Box):
         self.create_toast(_("{} removed").format(self.name), "remove")
 
     def set_loading(self, state: int) -> None:
+        """Track pending cover downloads (main thread only)"""
         self.loading += state
-        loading = self.loading > 0
-
-        self.cover.set_opacity(int(not loading))
-        self.spinner.set_visible(loading)
+        if self.widget:
+            self.widget.update_loading()
 
     def get_cover_path(self) -> Optional[Path]:
         cover_path = shared.covers_dir / f"{self.game_id}.gif"
@@ -167,26 +160,6 @@ class Game(Gtk.Box):
             return cover_path  # type: ignore
 
         return None
-
-    def toggle_play(
-        self, _widget: Any, _prop1: Any, _prop2: Any, state: bool = True
-    ) -> None:
-        if not self.menu_button.get_active():
-            self.play_revealer.set_reveal_child(not state)
-            self.menu_revealer.set_reveal_child(not state)
-
-    def main_button_clicked(self, _widget: Any, button: bool) -> None:
-        if shared.schema.get_boolean("cover-launches-game") ^ button:
-            self.launch()
-        else:
-            shared.win.show_details_page(self)
-
-    def set_play_icon(self) -> None:
-        self.play_button.set_icon_name(
-            "help-about-symbolic"
-            if shared.schema.get_boolean("cover-launches-game")
-            else "media-playback-start-symbolic"
-        )
 
     @GObject.Signal(name="update-ready", arg_types=[object])
     def update_ready(self, _additional_data):  # type: ignore

@@ -324,7 +324,8 @@ class CartridgesWindow(Adw.ApplicationWindow):
 
     def on_cover_launches_game_changed(self, *_args: Any) -> None:
         for game in shared.store:
-            game.set_play_icon()
+            if game.widget:
+                game.widget.set_play_icon()
 
     def set_library_child(self) -> None:
         child, hidden_child = self.notice_empty, self.hidden_notice_empty
@@ -360,7 +361,7 @@ class CartridgesWindow(Adw.ApplicationWindow):
             remove_from_overlay(self.hidden_notice_no_results)
 
     def filter_func(self, child: Gtk.Widget) -> bool:
-        game = child.get_child()
+        game = child.get_child().game
         text = (
             (
                 self.hidden_search_entry
@@ -463,7 +464,7 @@ class CartridgesWindow(Adw.ApplicationWindow):
         elif self.sort_state == "a-z":
             order = False
 
-        game1, game2 = child1.get_child(), child2.get_child()
+        game1, game2 = child1.get_child().game, child2.get_child().game
 
         def get_value(game: Game, attr: str) -> str:
             return str(getattr(game, attr)).lower().removeprefix("the ")
@@ -535,7 +536,7 @@ class CartridgesWindow(Adw.ApplicationWindow):
                 break
 
             if self.filter_func(child):
-                self.show_details_page(child.get_child())
+                self.show_details_page(child.get_child().game)
                 break
 
             index += 1

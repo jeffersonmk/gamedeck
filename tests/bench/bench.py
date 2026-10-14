@@ -198,6 +198,19 @@ def child(args: argparse.Namespace) -> None:
         result["rss_mb_startup"] = rss_mb()
         result["games_loaded"] = len(shared.store)
 
+        # Sanity check: every visible game must have a card in the grid,
+        # otherwise a broken build would show suspiciously good numbers
+        def n_cards(flowbox) -> int:
+            n = 0
+            while flowbox.get_child_at_index(n):
+                n += 1
+            return n
+
+        shown = sum(not (g.removed or g.blacklisted) for g in shared.store)
+        result["cards"] = n_cards(win.library) + n_cards(win.hidden_library)
+        if result["cards"] != shown:
+            raise SystemExit(f"Only {result['cards']} of {shown} games have a card")
+
         if args.import_games:
             gaps.clear()
             last_tick[0] = time.perf_counter()
