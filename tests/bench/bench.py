@@ -215,11 +215,14 @@ def child(args: argparse.Namespace) -> None:
         ts = time.perf_counter()
         if grid:
             win.library_sorter.changed(Gtk.SorterChange.DIFFERENT)
+            if hasattr(win, "scroll_to_top"):
+                win.scroll_to_top()
         else:
             win.library.invalidate_sort()
         result["sort_ms"] = (time.perf_counter() - ts) * 1000
 
         result["rss_mb_startup"] = rss_mb()
+        result["covers_in_memory_startup"] = cover_memory()[0]
         result["games_loaded"] = len(shared.store)
 
         # Sanity check: every visible game must be in the grid, otherwise a
@@ -246,6 +249,94 @@ def child(args: argparse.Namespace) -> None:
         if result["cards"] != shown:
             raise SystemExit(f"Only {result['cards']} of {shown} games have a card")
 
+        if args.scroll and grid:
+            GLib.timeout_add(50, scroll_through, app)
+        else:
+            start_import(app)
+        return False
+
+    def cover_memory() -> tuple[int, float]:
+        """Decoded covers kept in memory and their size in MB"""
+        n, size = 0, 0
+        for cover in shared.win.game_covers.values():
+            for texture in (cover.texture, cover.blurred):
+                if texture is not None and texture is not cover.placeholder_small:
+                    n += texture is cover.texture
+                    size += texture.get_width() * texture.get_height() * 4
+        return n, size / 1024**2
+
+    def scroll_through(app) -> None:
+        """Scroll the whole library a page at a time, like a user browsing,
+        then open the details page of many games"""
+        win = shared.win
+        adj = win.scrolledwindow.get_vadjustment()
+        # Start from the top (builds before step 4 kept the sort's jump)
+        win.library.scroll_to(0, Gtk.ListScrollFlags.NONE, None)
+        ts = time.perf_counter()
+        passes: list[int] = []
+
+        def covers_shown() -> bool:
+            return all(c.texture is not None or c.animation or not c.path
+                       or not c.pictures for c in win.game_covers.values())
+
+        def step() -> bool:
+            if not covers_shown():
+                return True
+            if os.environ.get("BENCH_DEBUG"):
+                with open(os.environ["BENCH_DEBUG"], "a") as dbg:
+                    dbg.write(f"check {adj.get_value():.0f}+{adj.get_page_size():.0f}"
+                              f"/{adj.get_upper():.0f} bound="
+                              f"{sum(w.game is not None for w in __import__('cartridges.game_widget', fromlist=['x']).GameWidget.instances)}\n")
+            if (adj.get_value() + adj.get_page_size() >= adj.get_upper() - 1
+                    and len(passes) + 1 < args.scroll_passes):
+                # Another pass, to check that memory stays flat
+                passes.append(round(rss_mb()))
+                adj.set_value(0)
+                return True
+            if adj.get_value() + adj.get_page_size() >= adj.get_upper() - 1:
+                passes.append(round(rss_mb()))
+                result["rss_mb_per_scroll_pass"] = passes
+                result["scroll_s"] = time.perf_counter() - ts
+                result["rss_mb_after_scroll"] = rss_mb()
+                result["covers_in_memory_after_scroll"], result["cover_mb_after_scroll"] = (
+                    cover_memory())
+                from cartridges import game_cover
+
+                if hasattr(game_cover, "cache_stats"):
+                    n, size = game_cover.cache_stats()
+                    result["cache_covers_after_scroll"] = n
+                    result["cache_mb_after_scroll"] = size / 1024**2
+                adj.set_value(0)
+                games = [win.library_model.get_item(i % win.library_model.get_n_items())
+                         for i in range(args.details)]
+                GLib.timeout_add(20, details, games)
+                return False
+            adj.set_value(adj.get_value() + adj.get_page_size())
+            if os.environ.get("BENCH_DEBUG"):
+                with open(os.environ["BENCH_DEBUG"], "a") as dbg:
+                    dbg.write(f"scroll {adj.get_value():.0f}/{adj.get_upper():.0f} "
+                                 f"page {adj.get_page_size():.0f} covers {cover_memory()[0]}\n")
+            # Let GTK lay out and bind the cards of the new page
+            win.library.queue_allocate()
+            GLib.timeout_add(int(os.environ.get("BENCH_SCROLL_MS", "40")), lambda: GLib.timeout_add(10, step) and False)
+            return False
+
+        def details(games) -> bool:
+            if len(games) % 250 == 0:
+                result.setdefault("rss_mb_per_250_details", []).append(round(rss_mb()))
+            if games:
+                win.show_details_page(games.pop())
+                win.navigation_view.pop()
+                return True
+            result["rss_mb_after_details"] = rss_mb()
+            result["covers_in_memory_after_details"], result["cover_mb_after_details"] = (
+                cover_memory())
+            start_import(app)
+            return False
+
+        GLib.timeout_add(20, step)
+
+    def start_import(app) -> None:
         if args.import_games:
             gaps.clear()
             last_tick[0] = time.perf_counter()
@@ -281,7 +372,6 @@ def child(args: argparse.Namespace) -> None:
         else:
             print("BENCH " + json.dumps(result), flush=True)
             app.quit()
-        return False
 
     class BenchApp(app_cls):
         def do_activate(self):
@@ -339,6 +429,16 @@ def parent(args: argparse.Namespace) -> None:
         stderr=subprocess.DEVNULL,
     )
     time.sleep(0.5)
+    # Broadway only paints (and so only lays out on time) while a browser is
+    # connected. Optional headless browser: BENCH_BROWSER=/path/to/chrome
+    browser = None
+    if os.environ.get("BENCH_BROWSER"):
+        browser = subprocess.Popen(
+            [os.environ["BENCH_BROWSER"], "--headless", "--no-sandbox",
+             "--window-size=1600,1000", "--user-data-dir=" + str(work / "browser"),
+             f"http://127.0.0.1:{8080 + int(display[1:])}/"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
     runs = []
     try:
         for n in range(args.runs):
@@ -364,13 +464,16 @@ def parent(args: argparse.Namespace) -> None:
             }
             cmd = [sys.executable, __file__, "--child", "--prefix", str(prefix),
                    "--games", str(args.games), "--import-games",
-                   str(args.import_games)]
+                   str(args.import_games)] + (
+                       ["--scroll", "--scroll-passes", str(args.scroll_passes),
+                        "--details", str(args.details)] if args.scroll else [])
             out = subprocess.run(cmd, env=env, capture_output=True, text=True,
                                  timeout=900, check=False)
             line = next((l for l in out.stdout.splitlines() if l.startswith("BENCH ")),
                         None)
             if not line:
                 sys.stderr.write(out.stdout[-3000:] + out.stderr[-6000:])
+
                 raise SystemExit(f"run {n} failed (exit {out.returncode})")
             runs.append(json.loads(line[6:]))
             # Temporary files the app left behind (never cleaned up = leak)
@@ -379,6 +482,8 @@ def parent(args: argparse.Namespace) -> None:
             )
             print(f"run {n}: {runs[-1]}", flush=True)
     finally:
+        if browser:
+            browser.terminate()
         broadway.terminate()
 
     summary = {
@@ -405,5 +510,11 @@ if __name__ == "__main__":
         os.environ.get("TMPDIR", "/tmp"), "gamedeck-bench"))
     p.add_argument("--out")
     p.add_argument("--child", action="store_true")
+    p.add_argument("--scroll", action="store_true",
+                   help="scroll the whole library and open 300 details pages "
+                        "before importing (GridView builds only)")
+    p.add_argument("--scroll-passes", type=int, default=1)
+    p.add_argument("--details", type=int, default=300,
+                   help="details pages opened after scrolling")
     a = p.parse_args()
     child(a) if a.child else parent(a)

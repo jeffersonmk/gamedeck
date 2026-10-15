@@ -17,6 +17,7 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from os import cpu_count
@@ -81,12 +82,33 @@ def _apply_pending() -> bool:
     return False
 
 
+# Decoded covers that no widget shows anymore, least recently shown first.
+# They are kept so that scrolling back is instant, but only up to
+# CACHE_LIMIT bytes: older ones are freed and decoded again when needed.
+# Covers on screen are never freed and don't count towards the limit.
+CACHE_LIMIT = 64 * 1024**2
+_OFFSCREEN: "OrderedDict[GameCover, int]" = OrderedDict()
+_offscreen_bytes = 0
+
+
+def cache_stats() -> tuple[int, int]:
+    """Number and size in bytes of the cached, unused covers"""
+    return len(_OFFSCREEN), _offscreen_bytes
+
+
+def _texture_bytes(texture: Optional[Gdk.Texture]) -> int:
+    if texture is None or texture in (GameCover.placeholder, GameCover.placeholder_small):
+        return 0
+    return texture.get_width() * texture.get_height() * 4
+
+
 class GameCover:
     """Cover of a game, shared by every `Gtk.Picture` showing it.
 
     Images are decoded on demand: only when a picture is attached (a card
     scrolled into view, the details page...) or when `get_texture()` is
-    called. Covers of games that were never shown cost no memory.
+    called. Covers of games that were never shown cost no memory, and
+    covers that are no longer shown are freed once the cache is full.
     """
 
     texture: Optional[Gdk.Texture]
@@ -112,6 +134,34 @@ class GameCover:
         self._loading = False
         self.new_cover(path, initial=True)
 
+    def _memory(self) -> int:
+        size = _texture_bytes(self.texture) + _texture_bytes(self.blurred)
+        if self.animation:
+            size += self.animation.get_width() * self.animation.get_height() * 4
+        return size
+
+    def _update_cache(self) -> None:
+        """Track this cover in the cache of unused covers (main thread)"""
+        global _offscreen_bytes  # pylint: disable=global-statement
+        _offscreen_bytes -= _OFFSCREEN.pop(self, 0)
+        if self.pictures or not (size := self._memory()):
+            return
+        _OFFSCREEN[self] = size
+        _offscreen_bytes += size
+        while _offscreen_bytes > CACHE_LIMIT and _OFFSCREEN:
+            cover, size = _OFFSCREEN.popitem(last=False)
+            _offscreen_bytes -= size
+            cover._free()
+
+    def _free(self) -> None:
+        """Forget the decoded images; they are loaded again when shown"""
+        self._stop_animation()
+        self.texture = None
+        self.blurred = None
+        self.luminance = None
+        self.animation = None
+        self.anim_iter = None
+
     def new_cover(self, path: Optional[Path] = None, initial: bool = False) -> None:
         self._generation += 1
         self._loading = False
@@ -124,6 +174,7 @@ class GameCover:
         self.path = path
 
         if not self.pictures:
+            self._update_cache()
             return  # Loaded when a picture is attached
 
         if path and path.suffix != ".gif" and not initial:
@@ -170,6 +221,7 @@ class GameCover:
         if self.texture is None:
             self.texture = texture
         self.set_texture(self.texture)
+        self._update_cache()
 
     def get_texture(self) -> Gdk.Texture:
         if self.animation:
@@ -186,6 +238,7 @@ class GameCover:
                     return None
             # Needed now (e.g. by the details dialog): don't wait for the pool
             self.texture = _load_texture(self.path)
+            self._update_cache()
         return self.texture
 
     def get_blurred(self) -> Gdk.Texture:
@@ -214,11 +267,19 @@ class GameCover:
             else:
                 self.blurred = self.placeholder_small
                 self.luminance = (0.3, 0.5)
+            self._update_cache()
 
         return self.blurred
 
     def add_picture(self, picture: Gtk.Picture) -> None:
         self.pictures.add(picture)
+        self._update_cache()  # In use: not freed while shown
+        if self.path and self.path.suffix == ".gif" and not self.animation:
+            try:
+                self.animation = GdkPixbuf.PixbufAnimation.new_from_file(str(self.path))
+                self.anim_iter = self.animation.get_iter()
+            except GLib.Error:
+                pass
         if self.animation:
             self.update_animation((None, self.animation))
             return
@@ -230,6 +291,7 @@ class GameCover:
         if not self.pictures:
             # Nothing shows it: stop animating (restarted by add_picture)
             self._stop_animation()
+            self._update_cache()
 
     def set_texture(self, texture: Optional[Gdk.Texture]) -> None:
         for picture in self.pictures:

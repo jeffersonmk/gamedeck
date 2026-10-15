@@ -212,6 +212,7 @@ class CartridgesWindow(Adw.ApplicationWindow):
 
         self.filter_state = value
         self.library_filter.changed(Gtk.FilterChange.DIFFERENT)
+        self.scroll_to_top(self.library)
         self.set_library_child()
 
         if self.overlay_split_view.get_collapsed():
@@ -461,7 +462,21 @@ class CartridgesWindow(Adw.ApplicationWindow):
         (self.hidden_library_filter if hidden else self.library_filter).changed(
             Gtk.FilterChange.DIFFERENT
         )
+        self.scroll_to_top(self.hidden_library if hidden else self.library)
         self.set_library_child()
+
+    def scroll_to_top(self, *views: Gtk.GridView) -> None:
+        """Show the first games after the list changed
+
+        GridView keeps the card that was at the top in view when the list is
+        sorted or filtered, so without this a new sort order would jump to
+        wherever that game went (e.g. the end of the library).
+        """
+        for view in views or (self.library, self.hidden_library):
+            # scroll_to() moves GridView's anchor; setting the adjustment
+            # would be undone by the anchor on the next layout
+            if view.get_model().get_n_items():
+                view.scroll_to(0, Gtk.ListScrollFlags.NONE, None)
 
     def queue_set_library_child(self) -> None:
         """Coalesce several set_library_child() requests into one idle call"""
@@ -674,6 +689,7 @@ class CartridgesWindow(Adw.ApplicationWindow):
         action.set_state(state)
         self.sort_state = str(state).strip("'")
         self.library_sorter.changed(Gtk.SorterChange.DIFFERENT)
+        self.scroll_to_top()
 
         shared.state_schema.set_string("sort-mode", self.sort_state)
 

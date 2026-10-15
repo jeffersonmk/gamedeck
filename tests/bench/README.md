@@ -48,8 +48,16 @@ Python ≥ 3.12 it mixes threads, use with care).
   a cold start, run `sync; echo 3 > /proc/sys/vm/drop_caches` as root before
   each run (affects the whole system).
 * **Broadway ≠ Wayland**: Broadway does not paint without a connected client,
-  so real (GPU) rendering cost is not included. Widget layout and allocation
-  are.
+  so real (GPU) rendering cost is not included, and layout after scrolling
+  may not happen at all. Set `BENCH_BROWSER` to a headless Chromium to
+  connect one (needed for `--scroll`):
+  ```sh
+  BENCH_BROWSER=/path/to/chrome-headless-shell python3 tests/bench/bench.py \
+      --games 2000 --import-games 300 --scroll
+  ```
+  `--scroll` browses the whole library a page at a time (`--scroll-passes`
+  times) and then opens `--details` details pages, reporting memory and the
+  number of decoded covers kept.
 * **Flatpak**: not measured here. Manual procedure:
   ```sh
   flatpak install --user flathub org.gnome.Sdk//49 org.flatpak.Builder

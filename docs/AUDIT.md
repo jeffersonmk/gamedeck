@@ -118,7 +118,7 @@ Python code (e.g. parsing huge Steam libraries).
 | 1 ✅ | Low-risk fixes (items 1–13) | low | tests pass; no time regression in the benchmark; 0 temp files left |
 | 2 ✅ | Split `Game` (plain `GObject` model) from `GameWidget`; sources create models only | medium | no widget created off the main thread (checkable with a debug `assert`); all 9 sources import |
 | 3 ✅ | Replace `FlowBox` with `Gtk.GridView` + `Gtk.FilterListModel`/`SortListModel` | medium | RSS with 2000 games < 300 MB; `covers_ready_s` < 1 s; keyboard navigation and screen reader support preserved |
-| 4 | Size-bounded texture cache (LRU by bytes) loaded on demand by the `GridView` | low | stable memory over prolonged use (open/close details 1000×) |
+| 4 ✅ | Size-bounded texture cache (LRU by bytes) loaded on demand by the `GridView` | low | stable memory over prolonged use (open/close details 1000×) |
 | 5 | Flatpak: `--filesystem=host` → `host:ro`; CI on the GNOME 49 image | low | Flatpak build + import from every source + changing a cover all work |
 | 6 | Evaluate Rust **only** for a measured bottleneck | — | a profile showing > 100 ms of Python CPU on a hot path |
 
@@ -245,6 +245,40 @@ and a narrow window (3 columns, centered).
 
 **Not verified**: screen reader (Orca) behaviour, and the card menu opened
 with a real mouse click.
+
+## 6d. Step 4 — bounded cover cache
+
+`GameCover` frees the decoded images of covers that are no longer on screen
+once they use more than `CACHE_LIMIT` (64 MB, about 270 covers of 200×300):
+least recently shown first, decoded again when they come back into view.
+Covers on screen are never freed and don't count towards the limit. The
+blurred background of the details page and GIF animations are included.
+
+While measuring, a step 3 regression was found and fixed: `GridView` keeps
+the game that was at the top in view when the list changes, so changing the
+sort order jumped to wherever that game went (often the end of the
+library). Sorting, searching and choosing a source now scroll back to the
+first game (`window.scroll_to_top()`).
+
+**Results** (median of 3 runs, 2000 games; `tests/bench --scroll`: browse
+the whole library a page at a time, then open 300 details pages; a headless
+browser is connected to Broadway with `BENCH_BROWSER` so that GTK lays out
+and paints as on a real display)
+
+| Metric | Step 3 | Step 4 |
+|---|---:|---:|
+| Decoded covers kept after browsing the whole library | 1600 (366 MB) | **394 (90 MB)** |
+| RSS after browsing the whole library | 413 MB | **231 MB** |
+| RSS after also opening 300 details pages | 429 MB | **246 MB** |
+| RSS after also importing 300 games | 466 MB | **272 MB** |
+| Time to browse the whole library | 11.8 s | 11.9 s |
+| Startup, first frame / settled RSS (1024×768) | 0.76–0.87 s / 179 MB | 0.76 s / 179 MB |
+
+Prolonged use: 3 passes over the whole library → 233, 232, 229 MB; then 1000
+details pages → 228 to 241 MB. Memory stays flat.
+
+`sort_ms` in the benchmark went from 13 to 23 ms because it now includes
+scrolling back to the first game and showing its cards.
 
 ## 7. Known limitations
 

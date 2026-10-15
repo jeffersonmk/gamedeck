@@ -433,3 +433,59 @@ class GameWidgetTests(unittest.TestCase):
         self.card.create_menu(self.card.menu_button)
         self.assertIs(self.card.menu_button.get_menu_model(),
                       self.card.hidden_game_options)
+
+
+class CoverCacheTests(unittest.TestCase):
+    """Step 4: covers that are no longer shown are freed past a size limit."""
+
+    def setUp(self):
+        from cartridges import game_cover
+
+        self.gc = game_cover
+        self.dir = TMP / "covers-cache"
+        self.dir.mkdir(exist_ok=True)
+        self.old_limit = game_cover.CACHE_LIMIT
+        # Room for exactly two 20x30 covers (2400 bytes each)
+        game_cover.CACHE_LIMIT = 2 * 20 * 30 * 4
+
+    def tearDown(self):
+        self.gc.CACHE_LIMIT = self.old_limit
+        self.gc._OFFSCREEN.clear()  # forget the test covers
+        self.gc._offscreen_bytes = 0
+
+    def shown_cover(self, name):
+        path = self.dir / f"{name}.tiff"
+        Image.new("RGB", (20, 30)).save(path)
+        picture = FakePicture()
+        cover = self.gc.GameCover(path=path)
+        cover.add_picture(picture)
+        iterate_main_loop(until=lambda: cover.texture is not None, timeout=5)
+        self.assertIsNotNone(cover.texture)
+        return cover, picture
+
+    def test_least_recently_shown_cover_is_freed(self):
+        covers = [self.shown_cover(f"c{i}") for i in range(3)]
+        for cover, picture in covers:
+            cover.remove_picture(picture)
+        # c0 left the screen first: freed to stay within two covers
+        self.assertIsNone(covers[0][0].texture)
+        self.assertIsNotNone(covers[1][0].texture)
+        self.assertIsNotNone(covers[2][0].texture)
+        self.assertEqual(self.gc.cache_stats(), (2, self.gc.CACHE_LIMIT))
+
+    def test_covers_on_screen_are_never_freed(self):
+        covers = [self.shown_cover(f"s{i}") for i in range(4)]
+        self.assertTrue(all(c.texture is not None for c, _ in covers))
+        self.assertEqual(self.gc.cache_stats(), (0, 0))
+
+    def test_freed_cover_is_decoded_again_when_shown(self):
+        covers = [self.shown_cover(f"r{i}") for i in range(3)]
+        for cover, picture in covers:
+            cover.remove_picture(picture)
+        cover, picture = covers[0]
+        self.assertIsNone(cover.texture)
+        cover.add_picture(picture)
+        iterate_main_loop(until=lambda: cover.texture is not None, timeout=5)
+        self.assertEqual(picture.paintables[-1].get_width(), 20)
+        # Shown again: no longer in the cache of unused covers
+        self.assertNotIn(cover, self.gc._OFFSCREEN)
